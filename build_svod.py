@@ -16,8 +16,12 @@
 
 Запуск
 ------
-    python build_svod.py              — собрать; год/месяц определяются автоматически
-    python build_svod.py --year 2026  — указать год вручную
+    python build_svod.py                    — собрать; год/месяц определяются автоматически
+    python build_svod.py --year 2026        — указать год вручную
+    python build_svod.py --no-normalize     — без текстовой нормализации
+    python build_svod.py --collapse-preamble— дополнительно сворачивать преамбулы
+                                              «Вывод в ремонт … для проведения …»
+    python build_svod.py --dry-run          — ничего не сохранять, только отчёт
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import shutil
 import sys
 from collections import Counter, defaultdict, OrderedDict
 from copy import copy as _copy
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -559,13 +564,279 @@ def write_style_row(out_ws: Worksheet, row: int, text: str,
         out_ws.row_dimensions[row].height = rh
 
 
-def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict):
+# ---------------------------------------------------------------------------
+# Текстовая нормализация полей H (причины/условия) и N (вид ремонта, АГ, ...)
+# ---------------------------------------------------------------------------
+#
+# Правила сформированы на основе сопоставления ручного сводного графика мая
+# 2026 г. с исходными проектами. Каждое правило декларативно — регулярка +
+# человекочитаемое имя (для отчёта) + действие.
+#
+# Действия:
+#   * «H → N»  — короткая пометка в H вырезается и дописывается в конец N.
+#   * «H drop» — короткая пометка в H вырезается без переноса.
+#   * «ночь»   — «с включением на ночь» / «без включения на ночь» всегда
+#                убирается из H и (если ещё нет) дописывается к N.
+#   * «simple» — подстановки, применяемые и к H, и к N (общие нормализации).
+#   * «преамбула» — опциональное сворачивание «Вывод в ремонт … для проведения
+#                   <род. падеж> Y» → «<именительный падеж> Y» (флаг
+#                   --collapse-preamble).
+
+@dataclass
+class NormOptions:
+    """Настройки текстовой нормализации."""
+    enabled: bool = True
+    collapse_preamble: bool = False
+    dry_run: bool = False
+
+
+@dataclass
+class NormStats:
+    """Счётчики и детальный лог изменений для отчёта."""
+    counts: Counter = field(default_factory=Counter)
+    changes: list = field(default_factory=list)
+
+
+# --- (1) Фразы из H, которые переносятся в конец N --------------------------
+
+H_MOVE_TO_N_RULES: list[tuple[str, re.Pattern]] = [
+    ("H→N «с переводом на ОШВ»", re.compile(r"с\s+переводом\s+на\s+ОШВ",
+                                            re.IGNORECASE | re.UNICODE)),
+    ("H→N «с переводом на ОВ»",  re.compile(r"с\s+переводом\s+на\s+ОВ",
+                                            re.IGNORECASE | re.UNICODE)),
+    ("H→N «Совместно с …»",       re.compile(r"Совместно\s+с\s+.+",
+                                             re.IGNORECASE | re.UNICODE | re.DOTALL)),
+]
+
+
+# --- (2) Короткие «мусорные» ремарки, которые просто удаляются из H ---------
+
+H_DROP_RULES: list[tuple[str, re.Pattern]] = [
+    ("H убрано «не в транзите»",
+     re.compile(r"не\s+в\s+транзите", re.IGNORECASE | re.UNICODE)),
+    ("H убрано «с отключением без разбоки разъединителями»",
+     re.compile(r"с\s+отключением\s+без\s+разб[оё]ки\s+разъединителями",
+                re.IGNORECASE | re.UNICODE)),
+]
+
+
+# --- (3) Ночной режим — всегда переезжает из H в N --------------------------
+
+NIGHT_RULES: list[tuple[str, re.Pattern]] = [
+    ("«с включением на ночь» → N",
+     re.compile(r"с\s+включением\s+на\s+ночь",  re.IGNORECASE | re.UNICODE)),
+    ("«без включения на ночь» → N",
+     re.compile(r"без\s+включения\s+на\s+ночь", re.IGNORECASE | re.UNICODE)),
+]
+
+
+# --- (4) Общие подстановки (применяются к H и N) ---------------------------
+
+SIMPLE_SUBS: list[tuple[str, re.Pattern, object]] = [
+    ("ТДТ → точки деления транзита",
+     re.compile(r"\bТДТ\b", re.UNICODE), "точки деления транзита"),
+    ("«А.Г.: ВЗ» → «А.Г.: ВЗ.»",
+     re.compile(r"А\.Г\.:\s*ВЗ(?=\s)", re.UNICODE), "А.Г.: ВЗ."),
+    ("«Включить» → «Включение»",
+     re.compile(r"\bВключить\b", re.UNICODE), "Включение"),
+    ("«Вывести в ремонт» → «Вывод в ремонт»",
+     re.compile(r"\bВывести\s+в\s+ремонт\b", re.UNICODE), "Вывод в ремонт"),
+    ("«NNNNг» → «NNNN г.»",
+     re.compile(r"(\d{4})\s*г(?![а-яА-Я\.])", re.UNICODE), r"\1 г."),
+]
+
+
+# --- (5) Опциональный коллапс преамбул в N ---------------------------------
+
+PREAMBLE_RE = re.compile(
+    r"(?P<prefix>.*?)"
+    r"Вывод\w*\s+в\s+ремонт\s+"
+    r"(?P<obj>.+?)"
+    r"\s+(?P<link>на\s+время\s+проведения(?:\s+работ\s+по)?|"
+    r"для\s+проведения|для|на\s+время)\s+"
+    r"(?P<rest>.+)",
+    re.IGNORECASE | re.UNICODE | re.DOTALL,
+)
+
+GEN_TO_NOM: dict[str, tuple[str, str]] = {
+    "текущего ремонта":                 ("Текущий ремонт",       "текущий ремонт"),
+    "среднего ремонта":                 ("Средний ремонт",       "средний ремонт"),
+    "капитального ремонта":             ("Капитальный ремонт",   "капитальный ремонт"),
+    "технического обслуживания":        ("Техническое обслуживание", "техническое обслуживание"),
+    "профилактического восстановления": ("Профилактическое восстановление", "профилактическое восстановление"),
+    "профилактическому восстановлению": ("Профилактическое восстановление", "профилактическое восстановление"),
+    "испытаний":                        ("Проведение испытаний", "проведение испытаний"),
+}
+
+
+def _apply_h_rules(h: str, stats: NormStats) -> tuple[str, list[str]]:
+    """Вычёркивает из H все предусмотренные фрагменты.
+    Возвращает обновлённый H и список фрагментов для дописывания в N."""
+    moves: list[str] = []
+    text = h or ""
+
+    # Ночь — всегда переносим
+    for label, rx in NIGHT_RULES:
+        m = rx.search(text)
+        while m:
+            moves.append(m.group(0))
+            stats.counts[label] += 1
+            text = text[:m.start()] + text[m.end():]
+            m = rx.search(text)
+
+    # Короткие хвосты H → N
+    for label, rx in H_MOVE_TO_N_RULES:
+        m = rx.search(text)
+        if m:
+            moves.append(m.group(0))
+            stats.counts[label] += 1
+            text = text[:m.start()] + text[m.end():]
+
+    # Удаляемые пометки
+    for label, rx in H_DROP_RULES:
+        m = rx.search(text)
+        if m:
+            stats.counts[label] += 1
+            text = text[:m.start()] + text[m.end():]
+
+    # Чистка хвостов / повторов пробелов, но БЕЗ схлопывания пустых строк
+    # между абзацами (пользователь мог поставить их осознанно).
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    if re.fullmatch(r"[\s\.,;:]*", text or ""):
+        text = ""
+
+    return text, moves
+
+
+def _append_moves_to_note(n: str, moves: list[str]) -> str:
+    """Дописывает в конец N перенесённые из H фрагменты (без дублей)."""
+    if not moves:
+        return n or ""
+    result = (n or "").rstrip()
+    lowered = result.lower()
+    for frag in moves:
+        frag_norm = re.sub(r"\s+", " ", frag).strip()
+        if not frag_norm:
+            continue
+        if frag_norm.lower() in lowered:
+            continue
+        if not result:
+            result = frag_norm
+        elif result.endswith(".") or result.endswith(":"):
+            result = result + " " + frag_norm
+        else:
+            result = result + ". " + frag_norm
+        lowered = result.lower()
+    return result
+
+
+def _apply_simple_subs(s: str, stats: NormStats) -> str:
+    if not s:
+        return s
+    for label, rx, repl in SIMPLE_SUBS:
+        new, n_subs = rx.subn(repl, s)
+        if n_subs:
+            stats.counts[label] += n_subs
+            s = new
+    return s
+
+
+def _collapse_preamble(n: str, stats: NormStats) -> str:
+    """Сворачивает «Вывод в ремонт … для проведения <род> Y» в «<имен.> Y»."""
+    if not n:
+        return n
+    m = PREAMBLE_RE.match(n)
+    if not m:
+        return n
+    rest = m.group("rest")
+    leading_key = None
+    for k in sorted(GEN_TO_NOM.keys(), key=len, reverse=True):
+        if re.match(r"^" + re.escape(k) + r"\b", rest, re.IGNORECASE):
+            leading_key = k
+            break
+    if leading_key is None:
+        return n
+
+    stats.counts["Свёрнута преамбула «Вывод в ремонт … для проведения …»"] += 1
+    cap_form, _ = GEN_TO_NOM[leading_key]
+    rest_after = rest[len(leading_key):]
+    # Остальные совпадения в rest_after приводим к lowercase-форме.
+    for k in sorted(GEN_TO_NOM.keys(), key=len, reverse=True):
+        lc_form = GEN_TO_NOM[k][1]
+        rest_after = re.sub(r"\b" + re.escape(k) + r"\b", lc_form,
+                            rest_after, flags=re.IGNORECASE)
+    result = m.group("prefix") + cap_form + rest_after
+    result = re.sub(r"[ \t]+", " ", result).rstrip()
+    if not result.endswith("."):
+        result += "."
+    return result
+
+
+def normalize_cells(h: str, n: str, opts: NormOptions, stats: NormStats,
+                    row_label: str) -> tuple[str, str]:
+    """Главная функция нормализации. Возвращает (new_H, new_N).
+
+    Если opts.enabled = False — возвращает исходные значения без изменений.
+    Все сработавшие правила учитываются в stats.counts; при любом изменении
+    строка добавляется в stats.changes (для отчёта --dry-run)."""
+    if not opts.enabled:
+        return h or "", n or ""
+
+    orig_h, orig_n = h or "", n or ""
+
+    new_h, moves = _apply_h_rules(orig_h, stats)
+    new_n = _append_moves_to_note(orig_n, moves)
+
+    new_h = _apply_simple_subs(new_h, stats)
+    new_n = _apply_simple_subs(new_n, stats)
+
+    if opts.collapse_preamble:
+        new_n = _collapse_preamble(new_n, stats)
+
+    # Не логируем «пустое ≈ пустое» как изменение.
+    def _changed(a: str, b: str) -> bool:
+        if a == b:
+            return False
+        if (a or "").strip() == "" and (b or "").strip() == "":
+            return False
+        return True
+
+    if _changed(orig_h, new_h) or _changed(orig_n, new_n):
+        stats.changes.append({
+            "row_label": row_label,
+            "h_before":  orig_h,  "h_after": new_h,
+            "n_before":  orig_n,  "n_after": new_n,
+        })
+
+    return new_h, new_n
+
+
+def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict,
+                        opts: NormOptions, stats: NormStats):
     """Копирует строку оборудования из исходного листа, сохраняя стили и
-    внутристрочные объединения (A:D для названия, N:O для примечания и т.п.)."""
+    внутристрочные объединения (A:D для названия, N:O для примечания и т.п.),
+    после чего нормализует текстовые поля H и N."""
     src_ws = rec["src_ws"]
     src_row = rec["src_row"]
     copy_row_full(src_ws, src_row, out_ws, dst_row)
     copy_merges_in_row(src_ws, src_row, out_ws, dst_row)
+
+    h_cell = out_ws.cell(dst_row, 8)
+    n_cell = out_ws.cell(dst_row, 14)
+    row_label = f"R{dst_row} «{str(rec.get('name', '') or '')[:48]}»"
+    new_h, new_n = normalize_cells(
+        str(h_cell.value) if h_cell.value is not None else "",
+        str(n_cell.value) if n_cell.value is not None else "",
+        opts, stats, row_label,
+    )
+    if new_h != (h_cell.value or ""):
+        h_cell.value = new_h if new_h else None
+    if new_n != (n_cell.value or ""):
+        n_cell.value = new_n if new_n else None
 
 
 def write_signatures(ws_komi: Worksheet, out_ws: Worksheet,
@@ -582,7 +853,8 @@ def write_signatures(ws_komi: Worksheet, out_ws: Worksheet,
 
 def build_output(priority: dict, records: list[dict],
                  ws_komi: Worksheet, ws_arkh: Worksheet | None,
-                 month: int, year: int) -> openpyxl.Workbook:
+                 month: int, year: int,
+                 opts: NormOptions, stats: NormStats) -> openpyxl.Workbook:
     """Собирает итоговую книгу."""
     style_info = find_style_rows(ws_komi)
 
@@ -630,12 +902,12 @@ def build_output(priority: dict, records: list[dict],
                     if current_sub:
                         write_style_row(out_ws, cur, current_sub, ws_komi, sect_style_row)
                         cur += 1
-                write_equipment_row(out_ws, cur, r)
+                write_equipment_row(out_ws, cur, r, opts, stats)
                 cur += 1
         else:
             # «Плоские» группы (ЛЭП, АЧР, Прочее).
             for r in items:
-                write_equipment_row(out_ws, cur, r)
+                write_equipment_row(out_ws, cur, r, opts, stats)
                 cur += 1
 
     # Подписи.
@@ -649,13 +921,63 @@ def build_output(priority: dict, records: list[dict],
 
 # ---------------------------------------------------------------- ТОЧКА ВХОДА
 
+def _short(s: str, limit: int = 100) -> str:
+    """Укорачивает многострочный текст до одной строки ≤ limit символов."""
+    if s is None:
+        return ""
+    s = str(s).replace("\n", " ⏎ ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > limit:
+        s = s[: limit - 1] + "…"
+    return s
+
+
+def _print_norm_report(stats: NormStats, dry_run: bool) -> None:
+    """Печатает отчёт о применённых правилах нормализации текста."""
+    print()
+    print("Нормализация текста:")
+    if not stats.counts:
+        print("  изменений нет.")
+    else:
+        for label, c in sorted(stats.counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"  • {label}: {c}")
+
+    if dry_run:
+        print()
+        print("Детализация изменений (--dry-run, файл не сохранён):")
+        if not stats.changes:
+            print("  нет.")
+        for ch in stats.changes:
+            print(f"  {ch['row_label']}")
+            if ch['h_before'] != ch['h_after']:
+                print(f"    H: {_short(ch['h_before'])}")
+                print(f"     →  {_short(ch['h_after']) or '(пусто)'}")
+            if ch['n_before'] != ch['n_after']:
+                print(f"    N: {_short(ch['n_before'])}")
+                print(f"     →  {_short(ch['n_after']) or '(пусто)'}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Сборщик сводного графика ремонтов ЛЭП и сетевого оборудования."
     )
     parser.add_argument("--year", type=int, default=None,
                         help="Год в имени выходного файла (по умолчанию — из дат проекта или текущий).")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Отключить текстовую нормализацию полей H и N.")
+    parser.add_argument("--collapse-preamble", action="store_true",
+                        help="Сворачивать преамбулы «Вывод в ремонт … для проведения …» "
+                             "в краткую форму «<Вид ремонта> Y» (опытное правило).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Ничего не сохранять — только показать, что будет изменено.")
     args = parser.parse_args()
+
+    opts = NormOptions(
+        enabled=not args.no_normalize,
+        collapse_preamble=bool(args.collapse_preamble),
+        dry_run=bool(args.dry_run),
+    )
+    stats = NormStats()
 
     p_prio = find_file(FILE_PRIO)
     p_arkh = find_file(FILE_ARKH)
@@ -700,13 +1022,21 @@ def main():
     month, year = pick_month_year(records, args.year)
     print(f"Месяц сводного: {RU_MONTHS_NOM[month]} {year}")
 
-    out_wb = build_output(priority, records, template_ws, ws_arkh, month, year)
+    out_wb = build_output(priority, records, template_ws, ws_arkh, month, year,
+                          opts, stats)
 
     out_name = (
         f"Сводный график ремонтов ЛЭП и сетевого оборудования "
         f"на {RU_MONTHS_NOM[month]} {year} г.xlsx"
     )
     out_path = ROOT / out_name
+
+    _print_norm_report(stats, dry_run=opts.dry_run)
+
+    if opts.dry_run:
+        print()
+        print("[--dry-run] Итоговый файл не сохранён.")
+        return
 
     try:
         out_wb.save(out_path)
@@ -715,6 +1045,7 @@ def main():
         print("Закройте его и запустите скрипт ещё раз.")
         sys.exit(2)
 
+    print()
     print(f"Готово: {out_path}")
 
 
