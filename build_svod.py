@@ -33,11 +33,13 @@ import sys
 from collections import Counter, defaultdict, OrderedDict
 from copy import copy as _copy
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.worksheet import Worksheet
 
 # ------------------------------------------------------------------ КОНСТАНТЫ -
@@ -92,6 +94,31 @@ RU_MONTHS_NOM = [
     "июль",   "август",  "сентябрь", "октябрь", "ноябрь", "декабрь",
 ]
 
+RU_MONTHS_SHORT = [
+    "",
+    "янв", "фев", "мар", "апр", "май", "июн",
+    "июл", "авг", "сен", "окт", "ноя", "дек",
+]
+
+# ---- Высоты строк (пт) ----
+ROW_HEIGHT_SECTION = 22.0       # заголовок группы (ЛЭП 220 кВ, …)
+ROW_HEIGHT_SUBSECTION = 18.0    # подзаголовок объекта (ПС 220 кВ Вельск, …)
+ROW_HEIGHT_TOC = 18.0           # строка оглавления
+
+# ---- Заливка листа «Диаграмма» по виду ремонта (RGB без #) ----
+GANTT_COLORS: dict[str, str] = {
+    "ТР":  "B6D7A8",   # светло-зелёный
+    "СР":  "FFE599",   # светло-жёлтый
+    "КР":  "EA9999",   # розово-красный
+    "ВПр": "9FC5E8",   # голубой
+    "ИСП": "F9CB9C",   # оранжевый
+    "ЗРР": "B4A7D6",   # сиреневый
+    "БВР": "CCCCCC",   # серый
+}
+GANTT_COLOR_OTHER = "EEEEEE"
+GANTT_COLOR_WEEKEND = "F2F2F2"
+GANTT_SHEET_NAME = "Диаграмма"
+
 
 # ------------------------------------------------------------------ УТИЛИТЫ --
 
@@ -122,6 +149,72 @@ def parse_day_month(value, default_year: int) -> tuple[int, int, int] | None:
     if year < 100:
         year += 2000
     return (year, mon, day)
+
+
+def _cell_text_with_merges(ws: Worksheet, row: int, col: int) -> str:
+    """Возвращает текст ячейки; если ячейка внутри объединения и сама пустая —
+    вернёт текст «владельца» объединения (top-left-ячейки)."""
+    v = ws.cell(row, col).value
+    if v is not None and str(v).strip() != "":
+        return str(v)
+    for mr in ws.merged_cells.ranges:
+        if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
+            owner = ws.cell(mr.min_row, mr.min_col).value
+            if owner is not None:
+                return str(owner)
+            break
+    return ""
+
+
+def validate_project_template(ws: Worksheet, filename: str) -> None:
+    """Проверяет, что лист похож на экспорт ПК «Ремонты». Падает с понятным
+    сообщением, если формат не распознан."""
+    errors: list[str] = []
+
+    # 1. Имя листа.
+    if ws.title != "Page1":
+        errors.append(
+            f"ожидается лист с именем «Page1», найден «{ws.title}»"
+        )
+
+    # 2. Шапка и таблица: A6 — «Наименование оборудования», F6/G6 — «Дата ...»,
+    #    N6 — «Вид ремонта». Допускаем расхождения в пробелах/регистре.
+    def hdr(col: int) -> str:
+        return re.sub(r"\s+", " ", _cell_text_with_merges(ws, 6, col)).strip().lower()
+
+    a = hdr(1)
+    f = hdr(6)
+    g = hdr(7)
+    n = hdr(14)
+
+    if "наименован" not in a:
+        errors.append("в ячейке A6 не найдено «Наименование оборудования»")
+    if not ("дата" in f or "начал" in f or "начал" in g):
+        errors.append("в колонках F6/G6 не найдены «Дата начала/окончания»")
+    if not ("вид" in n or "ремонт" in n):
+        errors.append("в ячейке N6 не найдено «Вид ремонта»")
+
+    if errors:
+        print()
+        print(f"ОШИБКА: файл «{filename}» выглядит не как экспорт ПК «Ремонты».")
+        for e in errors:
+            print(f"  • {e}")
+        print()
+        print("Ожидаемый формат: лист «Page1», шапка в строках 1–6, заголовок")
+        print("  таблицы: A «Наименование оборудования», F/G «Дата начала/"
+              "окончания», N «Вид ремонта».")
+        print("Если ПК «Ремонты» выдал новый формат — сообщите разработчику, "
+              "приложив файл.")
+        sys.exit(3)
+
+
+def month_day_count(year: int, month: int) -> int:
+    """Количество дней в указанном месяце."""
+    if month == 12:
+        nxt = datetime(year + 1, 1, 1)
+    else:
+        nxt = datetime(year, month + 1, 1)
+    return (nxt - datetime(year, month, 1)).days
 
 
 def copy_cell_style(src, dst):
@@ -548,9 +641,11 @@ def write_title(out_ws: Worksheet, month: int, year: int):
 
 
 def write_style_row(out_ws: Worksheet, row: int, text: str,
-                    src_ws: Worksheet, style_row: int):
+                    src_ws: Worksheet, style_row: int,
+                    height: float | None = None):
     """Пишет строку-заголовок/подзаголовок на всю ширину таблицы, копируя
-    стиль из строки-образца проекта."""
+    стиль из строки-образца проекта. Если указан `height` — принудительно
+    выставляет высоту строки (pt); иначе копирует высоту из образца."""
     for c in range(1, TABLE_COLS + 1):
         copy_cell_style(src_ws.cell(style_row, c), out_ws.cell(row, c))
     out_ws.cell(row, 1).value = text
@@ -559,9 +654,12 @@ def write_style_row(out_ws: Worksheet, row: int, text: str,
         out_ws.merge_cells(rng)
     except Exception:
         pass
-    rh = src_ws.row_dimensions[style_row].height
-    if rh is not None:
-        out_ws.row_dimensions[row].height = rh
+    if height is not None:
+        out_ws.row_dimensions[row].height = height
+    else:
+        rh = src_ws.row_dimensions[style_row].height
+        if rh is not None:
+            out_ws.row_dimensions[row].height = rh
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +741,23 @@ SIMPLE_SUBS: list[tuple[str, re.Pattern, object]] = [
      re.compile(r"\bВывести\s+в\s+ремонт\b", re.UNICODE), "Вывод в ремонт"),
     ("«NNNNг» → «NNNN г.»",
      re.compile(r"(\d{4})\s*г(?![а-яА-Я\.])", re.UNICODE), r"\1 г."),
+    # Длинное тире между словами/числами (с пробелами вокруг).
+    # Не трогает составные обозначения вида «АТ-2», «ВЛ-125», «28-30.05».
+    ("Дефис между словами → длинное тире",
+     re.compile(r"(?<=[A-Za-zА-Яа-я0-9])\s-\s(?=[A-Za-zА-Яа-я0-9])", re.UNICODE),
+     " – "),
+    # Пробел между числом и «кВ»: «110кВ» → «110 кВ».
+    ("«NкВ» → «N кВ»",
+     re.compile(r"(\d+)кВ\b", re.UNICODE), r"\1 кВ"),
+    # Пробел между числом и «ч.»: «2ч» / «2ч.» → «2 ч.».
+    # Не трогаем «часть», «часа», «часах» (следующая буква — русская).
+    ("«Nч» → «N ч.»",
+     re.compile(r"(?<![а-яА-Я\d])(\d+)\s*ч\.?(?![а-яА-Яa-zA-Z])", re.UNICODE),
+     r"\1 ч."),
+    # «ч. 30 м» / «ч.30 м» / «ч. 30м» → «ч. 30 мин.» — строго в контексте времени.
+    ("«ч. Nм» → «ч. N мин.»",
+     re.compile(r"(ч\.?)\s*(\d+)\s*м\.?(?![а-яА-Я])", re.UNICODE),
+     r"\1 \2 мин."),
 ]
 
 
@@ -735,13 +850,27 @@ def _append_moves_to_note(n: str, moves: list[str]) -> str:
 
 
 def _apply_simple_subs(s: str, stats: NormStats) -> str:
+    """Применяет список SIMPLE_SUBS к строке. Учитывает в статистике только
+    фактические изменения (регекс может матчиться и на уже корректном тексте —
+    такие «тождественные» срабатывания не считаем)."""
     if not s:
         return s
     for label, rx, repl in SIMPLE_SUBS:
-        new, n_subs = rx.subn(repl, s)
-        if n_subs:
-            stats.counts[label] += n_subs
-            s = new
+        # Считаем, сколько матчей действительно меняют текст.
+        if isinstance(repl, str):
+            n_changed = sum(
+                1 for m in rx.finditer(s)
+                if m.expand(repl) != m.group(0)
+            )
+        else:
+            n_changed = sum(
+                1 for m in rx.finditer(s)
+                if repl(m) != m.group(0)
+            )
+        if n_changed == 0:
+            continue
+        s = rx.sub(repl, s)
+        stats.counts[label] += n_changed
     return s
 
 
@@ -838,6 +967,18 @@ def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict,
     if new_n != (n_cell.value or ""):
         n_cell.value = new_n if new_n else None
 
+    # Гарантируем перенос текста в H и N (для авто-подгонки высоты строки).
+    for cell in (h_cell, n_cell):
+        al = cell.alignment
+        if not al.wrap_text:
+            cell.alignment = Alignment(
+                horizontal=al.horizontal, vertical=al.vertical,
+                text_rotation=al.text_rotation, wrap_text=True,
+                shrink_to_fit=al.shrink_to_fit, indent=al.indent,
+            )
+    # Высоту строки данных не фиксируем — пусть Excel подгоняет сам.
+    out_ws.row_dimensions[dst_row].height = None
+
 
 def write_signatures(ws_komi: Worksheet, out_ws: Worksheet,
                      sig_start: int, dst_start: int) -> int:
@@ -849,6 +990,282 @@ def write_signatures(ws_komi: Worksheet, out_ws: Worksheet,
         copy_row_full(ws_komi, r, out_ws, dst_r)
         copy_merges_in_row(ws_komi, r, out_ws, dst_r)
     return dst_start + (sig_end - sig_start + 1)
+
+
+def write_toc(out_ws: Worksheet, toc_row: int,
+              group_anchors: dict[str, int]) -> None:
+    """Пишет в строке `toc_row` оглавление: по ячейке на каждую непустую
+    группу с гиперссылкой на строку её заголовка."""
+    if not group_anchors:
+        return
+
+    ordered = [g for g in GROUP_ORDER if g in group_anchors]
+    n = len(ordered)
+    if n == 0:
+        return
+
+    # Равномерно распределяем непустые группы по 25 колонкам.
+    base_width = TABLE_COLS // n
+    extra = TABLE_COLS - base_width * n
+    spans: list[tuple[int, int]] = []
+    col = 1
+    for i in range(n):
+        w = base_width + (1 if i < extra else 0)
+        spans.append((col, col + w - 1))
+        col += w
+
+    link_font = Font(name="Calibri", size=11, bold=True, color="0563C1",
+                     underline="single")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    out_ws.row_dimensions[toc_row].height = ROW_HEIGHT_TOC
+    for (lo, hi), g in zip(spans, ordered):
+        anchor = group_anchors[g]
+        cell = out_ws.cell(toc_row, lo)
+        cell.value = f"{GROUP_LABELS[g]} (стр. {anchor})"
+        cell.font = link_font
+        cell.alignment = center
+        cell.hyperlink = Hyperlink(
+            ref=cell.coordinate,
+            location=f"Page1!A{anchor}",
+            display=cell.value,
+        )
+        if hi > lo:
+            rng = (f"{get_column_letter(lo)}{toc_row}:"
+                   f"{get_column_letter(hi)}{toc_row}")
+            try:
+                out_ws.merge_cells(rng)
+            except Exception:
+                pass
+
+
+def _vid_remonta(n_text: str) -> str:
+    """Извлекает короткий код вида ремонта из текста N (ВПр/ТР/СР/КР/ИСП/ЗРР/БВР).
+    Возвращает пустую строку, если код не распознан."""
+    if not n_text:
+        return ""
+    m = re.match(r"\s*(ВПр|ТР|СР|КР|ИСП|ЗРР|БВР)\b", n_text)
+    return m.group(1) if m else ""
+
+
+def _gantt_day_span(rec: dict, month: int, year: int,
+                    scale_start: datetime, scale_end: datetime
+                    ) -> tuple[int, int] | None:
+    """По start/end записи возвращает (колонка_нач, колонка_кон) на шкале Ганта
+    (индексы от 1) относительно scale_start. None — если дат нет или они
+    полностью вне шкалы."""
+    s, e = rec.get("start"), rec.get("end")
+    if not s and not e:
+        return None
+    if s:
+        sd = datetime(s[0], s[1], s[2])
+    else:
+        sd = datetime(year, month, 1)
+    if e:
+        ed = datetime(e[0], e[1], e[2])
+    else:
+        ed = sd
+    if ed < sd:
+        sd, ed = ed, sd
+    if ed < scale_start or sd > scale_end:
+        return None
+    if sd < scale_start:
+        sd = scale_start
+    if ed > scale_end:
+        ed = scale_end
+    col_start = (sd - scale_start).days + 1
+    col_end   = (ed - scale_start).days + 1
+    return col_start, col_end
+
+
+def build_gantt_sheet(out_wb: openpyxl.Workbook, gantt_items: list[dict],
+                      month: int, year: int) -> None:
+    """Добавляет в книгу лист «Диаграмма» с Гант-календарём.
+    `gantt_items` — список словарей {row, group, rec}, в том же порядке, что
+    записи на основном листе."""
+    ws = out_wb.create_sheet(GANTT_SHEET_NAME)
+
+    if not gantt_items:
+        ws.cell(1, 1).value = "Нет строк для диаграммы."
+        return
+
+    # --- Шкала: от самой ранней start до самой поздней end, но гарантированно
+    # включаем весь целевой месяц.
+    month_start = datetime(year, month, 1)
+    month_end = datetime(year, month, month_day_count(year, month))
+    scale_start = month_start
+    scale_end = month_end
+    for it in gantt_items:
+        s, e = it["rec"].get("start"), it["rec"].get("end")
+        if s:
+            d = datetime(s[0], s[1], s[2])
+            if d < scale_start:
+                scale_start = d
+        if e:
+            d = datetime(e[0], e[1], e[2])
+            if d > scale_end:
+                scale_end = d
+
+    n_days = (scale_end - scale_start).days + 1
+
+    COL_NAME = 1       # A — имя объекта
+    COL_VID  = 2       # B — код вида ремонта
+    COL_DAYS = 3       # C — первый день шкалы
+    last_days_col = COL_DAYS + n_days - 1
+    legend_col = last_days_col + 2   # пустая колонка-разрыв + легенда
+
+    ws.column_dimensions[get_column_letter(COL_NAME)].width = 44
+    ws.column_dimensions[get_column_letter(COL_VID)].width = 7
+    for c in range(COL_DAYS, last_days_col + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 3.2
+
+    thin_font = Font(name="Calibri", size=9)
+    bold_font = Font(name="Calibri", size=10, bold=True)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    left   = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    # --- Строка 1: месяцы (объединённые) ---
+    cur = scale_start.replace(day=1)
+    while cur <= scale_end:
+        if cur.month == 12:
+            nxt = cur.replace(year=cur.year + 1, month=1)
+        else:
+            nxt = cur.replace(month=cur.month + 1)
+        seg_start = max(cur, scale_start)
+        seg_end = min(nxt - timedelta(days=1), scale_end)
+        col_from = COL_DAYS + (seg_start - scale_start).days
+        col_to = COL_DAYS + (seg_end - scale_start).days
+        cell = ws.cell(1, col_from)
+        cell.value = f"{RU_MONTHS_SHORT[cur.month]} {cur.year}"
+        cell.font = bold_font
+        cell.alignment = center
+        if col_to > col_from:
+            rng = (f"{get_column_letter(col_from)}1:"
+                   f"{get_column_letter(col_to)}1")
+            try:
+                ws.merge_cells(rng)
+            except Exception:
+                pass
+        cur = nxt
+
+    # --- Строка 2: числа дней + Строка 3: день недели ---
+    weekend_fill = PatternFill(start_color=GANTT_COLOR_WEEKEND,
+                               end_color=GANTT_COLOR_WEEKEND,
+                               fill_type="solid")
+    wday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    for i in range(n_days):
+        d = scale_start + timedelta(days=i)
+        col = COL_DAYS + i
+        c2 = ws.cell(2, col)
+        c2.value = d.day
+        c2.font = thin_font
+        c2.alignment = center
+        c3 = ws.cell(3, col)
+        c3.value = wday_names[d.weekday()]
+        c3.font = thin_font
+        c3.alignment = center
+        if d.weekday() >= 5:
+            c2.fill = weekend_fill
+            c3.fill = weekend_fill
+
+    # Заголовки A/B.
+    ws.cell(1, COL_NAME).value = "Объект"
+    ws.cell(1, COL_NAME).font = bold_font
+    ws.cell(1, COL_NAME).alignment = center
+    ws.cell(1, COL_VID).value = "Вид"
+    ws.cell(1, COL_VID).font = bold_font
+    ws.cell(1, COL_VID).alignment = center
+    try:
+        ws.merge_cells(f"{get_column_letter(COL_NAME)}1:"
+                       f"{get_column_letter(COL_NAME)}3")
+        ws.merge_cells(f"{get_column_letter(COL_VID)}1:"
+                       f"{get_column_letter(COL_VID)}3")
+    except Exception:
+        pass
+
+    ws.row_dimensions[1].height = 18
+    ws.row_dimensions[2].height = 14
+    ws.row_dimensions[3].height = 14
+
+    # --- Строки данных ---
+    row = 4
+    for it in gantt_items:
+        rec = it["rec"]
+        name = str(rec.get("name") or "").strip()
+        sub = str(rec.get("subgroup") or "").strip()
+        display = f"{sub}: {name}" if sub and sub.lower() != name.lower() else name
+
+        n_text = ""
+        try:
+            n_text = str(rec["src_ws"].cell(rec["src_row"], 14).value or "")
+        except Exception:
+            pass
+        vid = _vid_remonta(n_text)
+
+        ws.cell(row, COL_NAME).value = display
+        ws.cell(row, COL_NAME).font = thin_font
+        ws.cell(row, COL_NAME).alignment = left
+        ws.cell(row, COL_VID).value = vid or "—"
+        ws.cell(row, COL_VID).font = thin_font
+        ws.cell(row, COL_VID).alignment = center
+
+        # Подкрашиваем выходные в строке данных тоже.
+        for i in range(n_days):
+            d = scale_start + timedelta(days=i)
+            if d.weekday() >= 5:
+                ws.cell(row, COL_DAYS + i).fill = weekend_fill
+
+        span = _gantt_day_span(rec, month, year, scale_start, scale_end)
+        if span:
+            color = GANTT_COLORS.get(vid, GANTT_COLOR_OTHER)
+            fill = PatternFill(start_color=color, end_color=color,
+                               fill_type="solid")
+            for c in range(COL_DAYS + span[0] - 1, COL_DAYS + span[1]):
+                ws.cell(row, c).fill = fill
+        row += 1
+
+    # --- Легенда ---
+    ws.cell(1, legend_col).value = "Легенда"
+    ws.cell(1, legend_col).font = bold_font
+    ws.cell(1, legend_col).alignment = center
+    legend_rows = [
+        ("ТР",  "Текущий ремонт"),
+        ("СР",  "Средний ремонт"),
+        ("КР",  "Капитальный ремонт"),
+        ("ВПр", "Внеплановый ремонт"),
+        ("ИСП", "Испытания"),
+        ("ЗРР", "Заявка РР"),
+        ("БВР", "Без вывода в ремонт"),
+        ("—",   "Прочее / код не распознан"),
+    ]
+    for i, (code, desc) in enumerate(legend_rows):
+        r = 2 + i
+        color = GANTT_COLORS.get(code, GANTT_COLOR_OTHER)
+        c1 = ws.cell(r, legend_col)
+        c1.value = code
+        c1.font = thin_font
+        c1.alignment = center
+        c1.fill = PatternFill(start_color=color, end_color=color,
+                              fill_type="solid")
+        c2 = ws.cell(r, legend_col + 1)
+        c2.value = desc
+        c2.font = thin_font
+        c2.alignment = left
+    ws.column_dimensions[get_column_letter(legend_col)].width = 6
+    ws.column_dimensions[get_column_letter(legend_col + 1)].width = 28
+
+    # Закрепление областей: под шапкой и справа от столбцов-идентификаторов.
+    ws.freeze_panes = ws.cell(4, COL_DAYS).coordinate
+
+    # Печать — альбомная, вписать в 1 страницу по ширине.
+    try:
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+    except Exception:
+        pass
+    ws.print_area = (f"A1:{get_column_letter(legend_col + 1)}{row - 1}")
 
 
 def build_output(priority: dict, records: list[dict],
@@ -882,13 +1299,22 @@ def build_output(priority: dict, records: list[dict],
     grouped = group_and_sort(records, priority)
 
     sect_style_row = style_info["section_style_row"]
-    cur = style_info["header_last"] + 1
+    # Резервируем строку под оглавление; фактический текст TOC запишем в конце,
+    # когда будут известны позиции всех заголовков групп.
+    toc_row = style_info["header_last"] + 1
+    cur = toc_row + 1
+
+    group_anchors: dict[str, int] = {}
+    # Порядок записей в том же виде, в котором они идут на листе (для Гант-листа).
+    gantt_items: list[dict] = []
 
     for g in GROUP_ORDER:
         if g not in grouped or not grouped[g]:
             continue
         # Заголовок группы.
-        write_style_row(out_ws, cur, GROUP_LABELS[g], ws_komi, sect_style_row)
+        group_anchors[g] = cur
+        write_style_row(out_ws, cur, GROUP_LABELS[g], ws_komi, sect_style_row,
+                        height=ROW_HEIGHT_SECTION)
         cur += 1
 
         items = grouped[g]
@@ -900,21 +1326,34 @@ def build_output(priority: dict, records: list[dict],
                 if r["subgroup"] != current_sub:
                     current_sub = r["subgroup"]
                     if current_sub:
-                        write_style_row(out_ws, cur, current_sub, ws_komi, sect_style_row)
+                        write_style_row(out_ws, cur, current_sub, ws_komi,
+                                        sect_style_row,
+                                        height=ROW_HEIGHT_SUBSECTION)
                         cur += 1
                 write_equipment_row(out_ws, cur, r, opts, stats)
+                gantt_items.append({"row": cur, "group": g, "rec": r})
                 cur += 1
         else:
             # «Плоские» группы (ЛЭП, АЧР, Прочее).
             for r in items:
                 write_equipment_row(out_ws, cur, r, opts, stats)
+                gantt_items.append({"row": cur, "group": g, "rec": r})
                 cur += 1
+
+    # Оглавление (гиперссылки на строки заголовков групп).
+    write_toc(out_ws, toc_row, group_anchors)
 
     # Подписи.
     write_signatures(ws_komi, out_ws, style_info["sig_start"], cur)
 
     # установим область печати (A..Y)
     out_ws.print_area = f"A1:{LAST_COL_LETTER}{out_ws.max_row}"
+
+    # Второй лист — Гант-календарь.
+    build_gantt_sheet(out_wb, gantt_items, month, year)
+
+    # Основной лист должен открываться первым.
+    out_wb.active = 0
 
     return out_wb
 
@@ -1007,11 +1446,13 @@ def main():
     if p_arkh:
         wb_arkh = openpyxl.load_workbook(p_arkh)
         ws_arkh = wb_arkh["Page1"] if "Page1" in wb_arkh.sheetnames else wb_arkh.active
+        validate_project_template(ws_arkh, p_arkh.name)
         records += extract_records(ws_arkh, "Арх", default_year, "arkh")
 
     if p_komi:
         wb_komi = openpyxl.load_workbook(p_komi)
         ws_komi = wb_komi["Page1"] if "Page1" in wb_komi.sheetnames else wb_komi.active
+        validate_project_template(ws_komi, p_komi.name)
         records += extract_records(ws_komi, "Коми", default_year, "komi")
 
     print(f"Всего строк оборудования: {len(records)}")
