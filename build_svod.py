@@ -105,6 +105,22 @@ ROW_HEIGHT_SECTION = 22.0       # заголовок группы (ЛЭП 220 к
 ROW_HEIGHT_SUBSECTION = 18.0    # подзаголовок объекта (ПС 220 кВ Вельск, …)
 ROW_HEIGHT_TOC = 18.0           # строка оглавления
 
+# ---- Стандартные объединения в строке оборудования ----------------------
+# В проектах ПК «Ремонты» часть строк оборудования приходит без merge (или
+# с нестандартной раскладкой). В своднике хочется единообразия: имя
+# объекта занимает A:D, причины/условия — H:M, вид ремонта — N:O,
+# ответственный — X:Y.
+EQUIPMENT_MERGES: list[tuple[int, int]] = [
+    (1, 4),    # A..D — наименование оборудования
+    (8, 13),   # H..M — причины/условия
+    (14, 15),  # N..O — вид ремонта / примечание
+    (24, 25),  # X..Y — ответственный
+]
+
+# ---- Размеры шрифтов в строках данных (для расчёта высоты строки) -------
+EQ_FONT_PT_A = 10.0   # колонка A (наименование)
+EQ_FONT_PT_HN = 8.0   # колонки H и N (описания)
+
 # ---- Заливка листа «Диаграмма» по виду ремонта (RGB без #) ----
 GANTT_COLORS: dict[str, str] = {
     "ТР":  "B6D7A8",   # светло-зелёный
@@ -627,20 +643,37 @@ def write_header(ws_komi: Worksheet, out_ws: Worksheet, header_last: int):
 
 
 def write_title(out_ws: Worksheet, month: int, year: int):
-    """Обновляет текст заголовка в шапке: «на <месяц> <год> г.»"""
-    # Заголовок лежит в объединённой ячейке на 3-й строке (обычно C3:X3).
-    # Поищем ячейку, значение которой начинается с 'Сводный график ремонта'.
+    """Обновляет тексты в шапке сводного графика.
+
+    Конкретно:
+      * Заголовок «Сводный график ремонта …» — в объединённой ячейке на
+        3-й строке (обычно C3:X3).
+      * Год в грифе «Утверждаю …» (D1) — заменяем «YYYY года» на текущий.
+    """
+    title_done = False
     for r in range(1, 7):
         for c in range(1, TABLE_COLS + 1):
             v = out_ws.cell(r, c).value
-            if isinstance(v, str) and v.strip().startswith("Сводный график"):
+            if not isinstance(v, str):
+                continue
+            if not title_done and v.strip().startswith("Сводный график"):
                 new = (
                     "Сводный график ремонта ЛЭП и сетевого оборудования "
-                    "операционных зон Архангельского и Коми РДУ "
+                    "операционной зоны Коми РДУ "
                     f"на {RU_MONTHS_NOM[month]} {year} г."
                 )
                 out_ws.cell(r, c).value = new
-                return
+                title_done = True
+                continue
+            # Год в блоке «Утверждаю …» (обычно D1). Ищем шаблон «NNNN года»
+            # в любом тексте шапки — и ставим актуальный год. Использованы
+            # look-around вместо \b, т. к. перед годом может стоять «_»
+            # (подчёркивания строки подписи), а \b после «_» не срабатывает.
+            if re.search(r"(?<![0-9])\d{4}(?![0-9])\s*года", v):
+                new = re.sub(r"(?<![0-9])\d{4}(?![0-9])(\s*года)",
+                             rf"{year}\1", v)
+                if new != v:
+                    out_ws.cell(r, c).value = new
 
 
 def write_style_row(out_ws: Worksheet, row: int, text: str,
@@ -947,15 +980,111 @@ def normalize_cells(h: str, n: str, opts: NormOptions, stats: NormStats,
     return new_h, new_n
 
 
+def _sum_col_width(ws: Worksheet, lo: int, hi: int,
+                   default: float = 8.43) -> float:
+    """Суммарная ширина колонок [lo..hi] на листе в единицах Excel
+    («количество символов шрифта по умолчанию»). Неустановленные ширины
+    заменяются на `default` (стандарт Excel)."""
+    total = 0.0
+    for c in range(lo, hi + 1):
+        w = ws.column_dimensions[get_column_letter(c)].width
+        total += float(w) if w else default
+    return total
+
+
+def ensure_equipment_merges(ws: Worksheet, row: int,
+                            merges: list[tuple[int, int]] = EQUIPMENT_MERGES
+                            ) -> None:
+    """Гарантирует, что в строке оборудования есть стандартные объединения
+    A:D / H:M / N:O / X:Y. Если какой-то merge отсутствует — создаётся;
+    если в диапазон «влез» меньший merge из источника — он снимается и
+    переопределяется полностью."""
+    # Существующие одностроковые объединения в этой строке.
+    existing: list[tuple[int, int]] = [
+        (mr.min_col, mr.max_col)
+        for mr in ws.merged_cells.ranges
+        if mr.min_row == row and mr.max_row == row
+    ]
+    for lo, hi in merges:
+        if (lo, hi) in existing:
+            continue
+        # Снимаем частично пересекающиеся объединения внутри диапазона.
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_row != row or mr.max_row != row:
+                continue
+            # пересечение по колонкам
+            if not (mr.max_col < lo or mr.min_col > hi):
+                try:
+                    ws.unmerge_cells(str(mr))
+                except Exception:
+                    pass
+        rng = f"{get_column_letter(lo)}{row}:{get_column_letter(hi)}{row}"
+        try:
+            ws.merge_cells(rng)
+        except Exception:
+            pass
+
+
+def _count_wrapped_lines(text: str, chars_per_line: int) -> int:
+    """Оценка числа визуальных строк, которые займёт `text` при wrap_text,
+    если в одну строку помещается `chars_per_line` символов."""
+    if not text:
+        return 1
+    s = str(text)
+    chars_per_line = max(10, int(chars_per_line))
+    total = 0
+    for para in s.split("\n"):
+        if not para:
+            total += 1
+            continue
+        total += max(1, -(-len(para) // chars_per_line))
+    return max(total, 1)
+
+
+def estimate_eq_row_height(ws: Worksheet, a_text: str, h_text: str,
+                           n_text: str) -> float:
+    """Оценивает минимальную высоту строки оборудования (в пт), которой
+    хватит, чтобы уместить любой из текстов A/H/N при `wrap_text=True`.
+
+    Формула эмпирическая, но с запасом 10–15% — не вызывает наложений при
+    открытии файла в Excel без ручной «Autofit Row Height»."""
+    # Ширины merged-блоков в единицах Excel.
+    w_a = _sum_col_width(ws, 1, 4)
+    w_h = _sum_col_width(ws, 8, 13)
+    w_n = _sum_col_width(ws, 14, 15)
+    # Коэффициент: 1 unit ширины колонки ≈ 1 символ Calibri 11pt. Шрифт в
+    # наших ячейках (Arial 8/10) уже, поэтому символов влезает больше.
+    # 1.35 — консервативная оценка.
+    k_hn = 1.35   # Arial 8
+    k_a = 1.15    # Arial 10
+    lines_a = _count_wrapped_lines(a_text, w_a * k_a)
+    lines_h = _count_wrapped_lines(h_text, w_h * k_hn)
+    lines_n = _count_wrapped_lines(n_text, w_n * k_hn)
+    # Высота одной строки ≈ размер шрифта × 1.25–1.30.
+    h_a = lines_a * EQ_FONT_PT_A * 1.30
+    h_h = lines_h * EQ_FONT_PT_HN * 1.30
+    h_n = lines_n * EQ_FONT_PT_HN * 1.30
+    needed = max(h_a, h_h, h_n) + 3.0
+    # Минимум — чтобы было не ниже одной строки; потолок — 409 pt
+    # (стандартное ограничение Excel на высоту строки).
+    return max(15.0, min(needed, 409.0))
+
+
 def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict,
-                        opts: NormOptions, stats: NormStats):
+                        opts: NormOptions, stats: NormStats,
+                        force_height: bool = True):
     """Копирует строку оборудования из исходного листа, сохраняя стили и
     внутристрочные объединения (A:D для названия, N:O для примечания и т.п.),
-    после чего нормализует текстовые поля H и N."""
+    после чего нормализует текстовые поля H и N.
+
+    Если `force_height=True` — высота строки рассчитывается исходя из длины
+    текстов (чтобы в Excel не было визуальных наложений)."""
     src_ws = rec["src_ws"]
     src_row = rec["src_row"]
     copy_row_full(src_ws, src_row, out_ws, dst_row)
     copy_merges_in_row(src_ws, src_row, out_ws, dst_row)
+    # Гарантируем стандартный набор объединений в строке данных.
+    ensure_equipment_merges(out_ws, dst_row)
 
     h_cell = out_ws.cell(dst_row, 8)
     n_cell = out_ws.cell(dst_row, 14)
@@ -970,7 +1099,8 @@ def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict,
     if new_n != (n_cell.value or ""):
         n_cell.value = new_n if new_n else None
 
-    # Гарантируем перенос текста в H и N (для авто-подгонки высоты строки).
+    # Гарантируем перенос текста в H и N (для корректного отображения
+    # многострочных описаний).
     for cell in (h_cell, n_cell):
         al = cell.alignment
         if not al.wrap_text:
@@ -979,8 +1109,21 @@ def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict,
                 text_rotation=al.text_rotation, wrap_text=True,
                 shrink_to_fit=al.shrink_to_fit, indent=al.indent,
             )
-    # Высоту строки данных не фиксируем — пусть Excel подгоняет сам.
-    out_ws.row_dimensions[dst_row].height = None
+
+    # Высота строки: берём максимум из скопированной и расчётной. Это
+    # спасает от двух крайностей: (1) очень длинные тексты в Ограничениях
+    # ОЗ (копия из исходника даёт 409 pt — сохраняем); (2) проекты, где
+    # высота не выставлена или занижена — добираем расчётом.
+    if force_height:
+        a_text = str(out_ws.cell(dst_row, 1).value or "")
+        est = estimate_eq_row_height(out_ws, a_text,
+                                     str(new_h or ""), str(new_n or ""))
+        existing = out_ws.row_dimensions[dst_row].height or 0.0
+        out_ws.row_dimensions[dst_row].height = max(existing, est)
+        try:
+            out_ws.row_dimensions[dst_row].customHeight = True
+        except Exception:
+            pass
 
 
 def write_signatures(ws_komi: Worksheet, out_ws: Worksheet,
@@ -1626,12 +1769,15 @@ def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
         else:
             ws.row_dimensions[r].height = ROW_HEIGHT_SUBSECTION
 
-    # wrap_text для H/N в строках данных + авто-подгонка высоты.
+    # wrap_text для H/N в строках данных + пересчёт высоты по тексту.
     for r in range(header_last + 1, data_last + 1):
         if is_toc_row(ws, r) or is_section_row(ws, r):
             continue
         if not is_equipment_row(ws, r):
             continue
+        # Гарантируем стандартные объединения (на случай, если сводник был
+        # собран ранней версией скрипта, где merge мог отсутствовать).
+        ensure_equipment_merges(ws, r)
         for col in (8, 14):
             cell = ws.cell(r, col)
             al = cell.alignment
@@ -1641,7 +1787,16 @@ def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
                     text_rotation=al.text_rotation, wrap_text=True,
                     shrink_to_fit=al.shrink_to_fit, indent=al.indent,
                 )
-        ws.row_dimensions[r].height = None
+        a_text = str(ws.cell(r, 1).value or "")
+        h_text = str(ws.cell(r, 8).value or "")
+        n_text = str(ws.cell(r, 14).value or "")
+        est = estimate_eq_row_height(ws, a_text, h_text, n_text)
+        existing = ws.row_dimensions[r].height or 0.0
+        ws.row_dimensions[r].height = max(existing, est)
+        try:
+            ws.row_dimensions[r].customHeight = True
+        except Exception:
+            pass
 
     _save_with_backup(wb, svod_path, log=log)
 
