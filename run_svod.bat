@@ -4,21 +4,31 @@ setlocal
 
 rem =============================================================================
 rem  Запуск сборщика сводного графика ремонтов (Windows).
-rem  Двойной клик — и в этой же папке появится сводный файл.
+rem
+rem  По умолчанию — открывает GUI (gui_svod.py) с кнопками.
+rem  Если передать аргументы (например --stage all), запустит CLI (build_svod.py).
+rem
+rem  Двойной клик — и открывается окно с кнопками.
 rem =============================================================================
 
 cd /d "%~dp0"
 
+if "%~1"=="" (
+    set "SCRIPT=gui_svod.py"
+) else (
+    set "SCRIPT=build_svod.py"
+)
+
 rem Предпочитаемый запуск через py launcher (ставится вместе с Python на Windows).
 where py >nul 2>nul
 if %errorlevel%==0 (
-    py -3 "build_svod.py" %*
+    py -3 "%SCRIPT%" %*
     goto :after
 )
 
 where python >nul 2>nul
 if %errorlevel%==0 (
-    python "build_svod.py" %*
+    python "%SCRIPT%" %*
     goto :after
 )
 
@@ -32,6 +42,9 @@ pause
 exit /b 1
 
 :after
+rem В GUI-режиме (без аргументов) окно закроется по крестику — пауза не нужна.
+if "%~1"=="" goto :eof
+
 echo.
 if %errorlevel% neq 0 (
     echo [!] Сборка завершилась с ошибкой. Проверьте сообщение выше.

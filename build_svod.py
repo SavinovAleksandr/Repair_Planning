@@ -119,6 +119,9 @@ GANTT_COLOR_OTHER = "EEEEEE"
 GANTT_COLOR_WEEKEND = "F2F2F2"
 GANTT_SHEET_NAME = "Диаграмма"
 
+BACKUP_DIR = ROOT / "backups"
+SVOD_FILE_PREFIX = "Сводный график ремонтов"
+
 
 # ------------------------------------------------------------------ УТИЛИТЫ --
 
@@ -1271,8 +1274,22 @@ def build_gantt_sheet(out_wb: openpyxl.Workbook, gantt_items: list[dict],
 def build_output(priority: dict, records: list[dict],
                  ws_komi: Worksheet, ws_arkh: Worksheet | None,
                  month: int, year: int,
-                 opts: NormOptions, stats: NormStats) -> openpyxl.Workbook:
-    """Собирает итоговую книгу."""
+                 opts: NormOptions, stats: NormStats,
+                 apply_sort: bool = True,
+                 apply_toc: bool = True,
+                 apply_heights: bool = True,
+                 apply_gantt: bool = True) -> openpyxl.Workbook:
+    """Собирает итоговую книгу.
+
+    Флаги-стадии позволяют выключить отдельные преобразования:
+      * apply_sort    — группировать и сортировать по приоритетам. Если False —
+                        строки идут в порядке `records`, но классификация (для
+                        заголовков групп) выполняется всегда.
+      * apply_toc     — писать строку-оглавление со ссылками на группы.
+      * apply_heights — фиксировать высоту строк-заголовков (секций/подсекций).
+      * apply_gantt   — создавать лист «Диаграмма».
+    Нормализация текста управляется `opts.enabled`.
+    """
     style_info = find_style_rows(ws_komi)
 
     out_wb = openpyxl.Workbook()
@@ -1296,7 +1313,21 @@ def build_output(priority: dict, records: list[dict],
     write_title(out_ws, month, year)
 
     # Группированные записи.
-    grouped = group_and_sort(records, priority)
+    if apply_sort:
+        grouped = group_and_sort(records, priority)
+    else:
+        # Только классификация, без переупорядочивания: сохраняем порядок
+        # строк из `records`, но раскладываем по корзинам согласно classify().
+        buckets: "OrderedDict[str, list[dict]]" = OrderedDict()
+        for rec in records:
+            g, sub = classify(rec)
+            rec["group"] = g
+            rec["subgroup"] = sub
+            buckets.setdefault(g, []).append(rec)
+        grouped = OrderedDict()
+        for g in GROUP_ORDER:
+            if g in buckets and buckets[g]:
+                grouped[g] = buckets[g]
 
     sect_style_row = style_info["section_style_row"]
     # Резервируем строку под оглавление; фактический текст TOC запишем в конце,
@@ -1308,13 +1339,16 @@ def build_output(priority: dict, records: list[dict],
     # Порядок записей в том же виде, в котором они идут на листе (для Гант-листа).
     gantt_items: list[dict] = []
 
+    section_h = ROW_HEIGHT_SECTION if apply_heights else None
+    subsection_h = ROW_HEIGHT_SUBSECTION if apply_heights else None
+
     for g in GROUP_ORDER:
         if g not in grouped or not grouped[g]:
             continue
         # Заголовок группы.
         group_anchors[g] = cur
         write_style_row(out_ws, cur, GROUP_LABELS[g], ws_komi, sect_style_row,
-                        height=ROW_HEIGHT_SECTION)
+                        height=section_h)
         cur += 1
 
         items = grouped[g]
@@ -1328,7 +1362,7 @@ def build_output(priority: dict, records: list[dict],
                     if current_sub:
                         write_style_row(out_ws, cur, current_sub, ws_komi,
                                         sect_style_row,
-                                        height=ROW_HEIGHT_SUBSECTION)
+                                        height=subsection_h)
                         cur += 1
                 write_equipment_row(out_ws, cur, r, opts, stats)
                 gantt_items.append({"row": cur, "group": g, "rec": r})
@@ -1341,7 +1375,8 @@ def build_output(priority: dict, records: list[dict],
                 cur += 1
 
     # Оглавление (гиперссылки на строки заголовков групп).
-    write_toc(out_ws, toc_row, group_anchors)
+    if apply_toc:
+        write_toc(out_ws, toc_row, group_anchors)
 
     # Подписи.
     write_signatures(ws_komi, out_ws, style_info["sig_start"], cur)
@@ -1350,12 +1385,416 @@ def build_output(priority: dict, records: list[dict],
     out_ws.print_area = f"A1:{LAST_COL_LETTER}{out_ws.max_row}"
 
     # Второй лист — Гант-календарь.
-    build_gantt_sheet(out_wb, gantt_items, month, year)
+    if apply_gantt:
+        build_gantt_sheet(out_wb, gantt_items, month, year)
 
     # Основной лист должен открываться первым.
     out_wb.active = 0
 
     return out_wb
+
+
+# ---------------------------------------------------------------------------
+# Работа с уже существующим сводником: парсер, резервные копии, inplace-стадии
+# ---------------------------------------------------------------------------
+
+
+def find_existing_svod(root: Path) -> Path | None:
+    """Возвращает путь к последнему (по mtime) файлу «Сводный график …xlsx»
+    в корне проекта. None — если файла нет."""
+    candidates = [
+        p for p in root.glob(f"{SVOD_FILE_PREFIX}*.xlsx")
+        if not p.name.startswith("~$")  # временный lock-файл Excel
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def make_backup(path: Path, log=print) -> Path | None:
+    """Кладёт копию `path` в `backups/<timestamp>__<имя>.xlsx`. Возвращает путь
+    к копии. Если файла нет — возвращает None."""
+    if not path.exists():
+        return None
+    BACKUP_DIR.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    dst = BACKUP_DIR / f"{ts}__{path.name}"
+    shutil.copy2(path, dst)
+    log(f"Резервная копия: backups/{dst.name}")
+    return dst
+
+
+def restore_latest_backup(svod_path: Path, log=print) -> Path | None:
+    """Восстанавливает `svod_path` из последней подходящей копии в `backups/`.
+    Возвращает путь к восстановленному файлу либо None, если копий нет."""
+    if not BACKUP_DIR.exists():
+        log("Папка backups/ не найдена — нечего восстанавливать.")
+        return None
+    prefix = svod_path.name
+    candidates = sorted(
+        BACKUP_DIR.glob(f"*__{prefix}"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        log(f"В backups/ нет копий «{prefix}».")
+        return None
+    latest = candidates[0]
+    # Сначала — копия текущего файла (на случай неудачного отката).
+    if svod_path.exists():
+        make_backup(svod_path, log=log)
+    shutil.copy2(latest, svod_path)
+    log(f"Восстановлено из: backups/{latest.name}")
+    return svod_path
+
+
+def is_toc_row(ws: Worksheet, row: int) -> bool:
+    """Строка-оглавление в сводника: хотя бы одна ячейка содержит гиперссылку
+    с локацией «Page1!A…»."""
+    for c in range(1, TABLE_COLS + 1):
+        cell = ws.cell(row, c)
+        hl = getattr(cell, "hyperlink", None)
+        if hl is None:
+            continue
+        loc = getattr(hl, "location", None) or ""
+        if "Page1" in str(loc):
+            return True
+    return False
+
+
+def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
+                              src_key: str = "svod") -> list[dict]:
+    """Аналог `extract_records`, но для уже сгенерированного сводника.
+
+    Пропускает строку оглавления и строки-заголовки групп (таких подгрупп
+    нет в проектах, они появляются только в своднике). Подзаголовки по
+    объектам (ПС/Электростанции) становятся current_section — как и в
+    исходных проектах."""
+    header_last, data_last, _sig_start = find_data_bounds(ws_svod)
+    recs: list[dict] = []
+    current_section = ""
+    group_label_lc = {v.strip().lower() for v in GROUP_LABELS.values()}
+
+    for r in range(header_last + 1, data_last + 1):
+        if is_toc_row(ws_svod, r):
+            continue
+        a = ws_svod.cell(r, 1).value
+        if a is None or (isinstance(a, str) and a.strip() == ""):
+            continue
+        name = str(a).strip()
+
+        if is_section_row(ws_svod, r):
+            if name.strip().lower() in group_label_lc:
+                # Заголовок группы верхнего уровня — данных не содержит.
+                current_section = ""
+                continue
+            current_section = name
+            continue
+
+        # Определяем, из какого РДУ запись. В своднике это признак косвенный:
+        # секция-подзаголовок может содержать «Архангельского» / «Коми».
+        rdu = "Коми"
+        sec_lc = current_section.lower()
+        if "арх" in sec_lc:
+            rdu = "Арх"
+        elif "коми" in sec_lc:
+            rdu = "Коми"
+
+        start_raw = ws_svod.cell(r, 6).value
+        end_raw = ws_svod.cell(r, 7).value
+        start = parse_day_month(start_raw, default_year)
+        end = parse_day_month(end_raw, default_year)
+
+        recs.append({
+            "rdu": rdu,
+            "section": current_section,
+            "name": name,
+            "start": start,
+            "end": end,
+            "src_ws": ws_svod,
+            "src_row": r,
+            "src_key": src_key,
+        })
+    return recs
+
+
+def _save_with_backup(wb: openpyxl.Workbook, out_path: Path, log=print):
+    """Сохраняет книгу по пути `out_path`, предварительно забэкапив старый
+    файл (если он был). Понятно отрабатывает PermissionError."""
+    if out_path.exists():
+        make_backup(out_path, log=log)
+    try:
+        wb.save(out_path)
+    except PermissionError:
+        raise RuntimeError(
+            f"Не удаётся сохранить «{out_path.name}» — вероятно, файл открыт "
+            f"в Excel. Закройте его и попробуйте ещё раз."
+        )
+    log(f"Сохранено: {out_path.name}")
+
+
+# --- Стадии, выполняемые «поверх» уже существующего сводника -----------------
+
+def stage_normalize_inplace(svod_path: Path, opts: NormOptions,
+                            stats: NormStats, log=print) -> None:
+    """Нормализует текст в столбцах H/N непосредственно в файле `svod_path`."""
+    log(f"Нормализация текста: {svod_path.name}")
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1» — это не похоже на сводный график.")
+    ws = wb["Page1"]
+    header_last, data_last, _ = find_data_bounds(ws)
+    opts.enabled = True  # стадия явно включает нормализацию
+    for r in range(header_last + 1, data_last + 1):
+        if is_toc_row(ws, r) or is_section_row(ws, r):
+            continue
+        if not is_equipment_row(ws, r):
+            continue
+        h_cell = ws.cell(r, 8)
+        n_cell = ws.cell(r, 14)
+        row_label = f"R{r} «{_short(str(ws.cell(r, 1).value or ''), 48)}»"
+        new_h, new_n = normalize_cells(
+            str(h_cell.value) if h_cell.value is not None else "",
+            str(n_cell.value) if n_cell.value is not None else "",
+            opts, stats, row_label,
+        )
+        if new_h != (h_cell.value or ""):
+            h_cell.value = new_h if new_h else None
+        if new_n != (n_cell.value or ""):
+            n_cell.value = new_n if new_n else None
+    _save_with_backup(wb, svod_path, log=log)
+
+
+def stage_build_toc_inplace(svod_path: Path, log=print) -> None:
+    """Пересоздаёт строку оглавления в уже существующем своднике."""
+    log(f"Оглавление: {svod_path.name}")
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1».")
+    ws = wb["Page1"]
+    header_last, data_last, _ = find_data_bounds(ws)
+
+    # Найдём якоря: строки-секции, текст которых совпадает с названием одной
+    # из групп верхнего уровня.
+    group_anchors: dict[str, int] = {}
+    label_to_key = {v.strip().lower(): k for k, v in GROUP_LABELS.items()}
+    for r in range(header_last + 1, data_last + 1):
+        if not is_section_row(ws, r):
+            continue
+        text = str(ws.cell(r, 1).value or "").strip().lower()
+        key = label_to_key.get(text)
+        if key and key not in group_anchors:
+            group_anchors[key] = r
+
+    toc_row = header_last + 1
+    # Сначала — unmerge в строке TOC (иначе ячейки в merged-диапазоне — read-only).
+    for mr in list(ws.merged_cells.ranges):
+        if mr.min_row == toc_row and mr.max_row == toc_row:
+            ws.unmerge_cells(str(mr))
+    # Затем чистим значения и гиперссылки старого оглавления.
+    for c in range(1, TABLE_COLS + 1):
+        cell = ws.cell(toc_row, c)
+        cell.value = None
+        cell.hyperlink = None
+
+    write_toc(ws, toc_row, group_anchors)
+    _save_with_backup(wb, svod_path, log=log)
+
+
+def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
+    """Фиксирует высоты строк-заголовков в уже существующем своднике и
+    включает wrap_text в столбцах H/N."""
+    log(f"Фиксация высот + wrap: {svod_path.name}")
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1».")
+    ws = wb["Page1"]
+    header_last, data_last, _ = find_data_bounds(ws)
+    label_set = {v.strip().lower() for v in GROUP_LABELS.values()}
+
+    toc_row = header_last + 1
+    if is_toc_row(ws, toc_row):
+        ws.row_dimensions[toc_row].height = ROW_HEIGHT_TOC
+
+    for r in range(header_last + 1, data_last + 1):
+        if not is_section_row(ws, r):
+            continue
+        text = str(ws.cell(r, 1).value or "").strip().lower()
+        if text in label_set:
+            ws.row_dimensions[r].height = ROW_HEIGHT_SECTION
+        else:
+            ws.row_dimensions[r].height = ROW_HEIGHT_SUBSECTION
+
+    # wrap_text для H/N в строках данных + авто-подгонка высоты.
+    for r in range(header_last + 1, data_last + 1):
+        if is_toc_row(ws, r) or is_section_row(ws, r):
+            continue
+        if not is_equipment_row(ws, r):
+            continue
+        for col in (8, 14):
+            cell = ws.cell(r, col)
+            al = cell.alignment
+            if not al.wrap_text:
+                cell.alignment = Alignment(
+                    horizontal=al.horizontal, vertical=al.vertical,
+                    text_rotation=al.text_rotation, wrap_text=True,
+                    shrink_to_fit=al.shrink_to_fit, indent=al.indent,
+                )
+        ws.row_dimensions[r].height = None
+
+    _save_with_backup(wb, svod_path, log=log)
+
+
+def stage_build_gantt_inplace(svod_path: Path, default_year: int,
+                              log=print) -> None:
+    """Пересоздаёт лист «Диаграмма» в уже существующем своднике."""
+    log(f"Диаграмма Ганта: {svod_path.name}")
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1».")
+    ws = wb["Page1"]
+
+    recs = extract_records_from_svod(ws, default_year=default_year)
+    # Классифицируем, чтобы gantt_items имели subgroup (для имени строки).
+    for rec in recs:
+        g, sub = classify(rec)
+        rec["group"] = g
+        rec["subgroup"] = sub or rec.get("section", "")
+    month, year = pick_month_year(recs, default_year if default_year else None)
+
+    if GANTT_SHEET_NAME in wb.sheetnames:
+        del wb[GANTT_SHEET_NAME]
+
+    gantt_items = [{"row": r["src_row"], "group": r["group"], "rec": r}
+                   for r in recs]
+    build_gantt_sheet(wb, gantt_items, month, year)
+    wb.active = wb.index(wb["Page1"])
+    _save_with_backup(wb, svod_path, log=log)
+
+
+# --- «Большие» стадии: полная пересборка ------------------------------------
+
+def _load_inputs(root: Path, year_hint: int | None, log=print
+                 ) -> tuple[dict, list[dict], Worksheet, int, int]:
+    """Загружает справочник и проекты, возвращает (priority, records,
+    template_ws, month, year). Падает с RuntimeError при проблемах."""
+    p_prio = find_file(FILE_PRIO)
+    p_arkh = find_file(FILE_ARKH)
+    p_komi = find_file(FILE_KOMI)
+
+    if not p_prio:
+        raise RuntimeError(
+            f"Не найден файл справочника «{FILE_PRIO}».\n"
+            f"Положите его в папку: {root}"
+        )
+    if not p_arkh and not p_komi:
+        raise RuntimeError(
+            f"Не найдены ни «{FILE_ARKH}», ни «{FILE_KOMI}».\n"
+            f"Положите хотя бы один из них в папку: {root}"
+        )
+
+    log("Найдены файлы:")
+    log(f"  • {p_prio}")
+    if p_arkh:
+        log(f"  • {p_arkh}")
+    if p_komi:
+        log(f"  • {p_komi}")
+
+    priority = load_priority(p_prio)
+    default_year = year_hint if year_hint else datetime.now().year
+    records: list[dict] = []
+    ws_arkh = ws_komi = None
+
+    if p_arkh:
+        wb_arkh = openpyxl.load_workbook(p_arkh)
+        ws_arkh = wb_arkh["Page1"] if "Page1" in wb_arkh.sheetnames else wb_arkh.active
+        validate_project_template(ws_arkh, p_arkh.name)
+        records += extract_records(ws_arkh, "Арх", default_year, "arkh")
+
+    if p_komi:
+        wb_komi = openpyxl.load_workbook(p_komi)
+        ws_komi = wb_komi["Page1"] if "Page1" in wb_komi.sheetnames else wb_komi.active
+        validate_project_template(ws_komi, p_komi.name)
+        records += extract_records(ws_komi, "Коми", default_year, "komi")
+
+    log(f"Всего строк оборудования: {len(records)}")
+    template_ws = ws_komi or ws_arkh
+    month, year = pick_month_year(records, year_hint)
+    log(f"Месяц сводного: {RU_MONTHS_NOM[month]} {year}")
+    return priority, records, template_ws, month, year
+
+
+def stage_full_rebuild(root: Path, year_hint: int | None,
+                       opts: NormOptions, stats: NormStats,
+                       log=print,
+                       apply_sort: bool = True,
+                       apply_toc: bool = True,
+                       apply_heights: bool = True,
+                       apply_gantt: bool = True) -> Path:
+    """Собирает сводный график «с нуля» из проектов, со всеми выбранными
+    стадиями. Возвращает путь к сохранённому файлу."""
+    priority, records, template_ws, month, year = _load_inputs(
+        root, year_hint, log=log)
+    out_wb = build_output(
+        priority, records, template_ws, None, month, year, opts, stats,
+        apply_sort=apply_sort, apply_toc=apply_toc,
+        apply_heights=apply_heights, apply_gantt=apply_gantt,
+    )
+    out_name = (
+        f"{SVOD_FILE_PREFIX} ЛЭП и сетевого оборудования "
+        f"на {RU_MONTHS_NOM[month]} {year} г.xlsx"
+    )
+    out_path = root / out_name
+    _save_with_backup(out_wb, out_path, log=log)
+    return out_path
+
+
+def stage_rebuild_from_existing(svod_path: Path, year_hint: int | None,
+                                opts: NormOptions, stats: NormStats,
+                                log=print) -> Path:
+    """Перечитывает существующий сводник и перестраивает его (полный набор
+    стадий: расстановка приоритетов + TOC + высоты + Гант + нормализация,
+    управляемая `opts`). Справочник приоритетов нужен обязательно.
+
+    Стили и подписи берутся из самого сводника — он же и шаблон."""
+    p_prio = find_file(FILE_PRIO)
+    if not p_prio:
+        raise RuntimeError(
+            f"Не найден файл справочника «{FILE_PRIO}».\n"
+            f"Положите его в папку: {ROOT}"
+        )
+    priority = load_priority(p_prio)
+
+    log(f"Читаем существующий сводник: {svod_path.name}")
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1».")
+    ws = wb["Page1"]
+
+    default_year = year_hint if year_hint else datetime.now().year
+    records = extract_records_from_svod(ws, default_year=default_year)
+    log(f"Строк оборудования в своднике: {len(records)}")
+
+    month, year = pick_month_year(records, year_hint)
+
+    out_wb = build_output(
+        priority, records, ws, None, month, year, opts, stats,
+        apply_sort=True, apply_toc=True, apply_heights=True, apply_gantt=True,
+    )
+    # Имя файла оставляем тем же (месяц/год могут чуть измениться — тогда
+    # возьмём новое имя). Бэкап старого выполнится в _save_with_backup.
+    out_name = (
+        f"{SVOD_FILE_PREFIX} ЛЭП и сетевого оборудования "
+        f"на {RU_MONTHS_NOM[month]} {year} г.xlsx"
+    )
+    out_path = svod_path.parent / out_name
+    # Если имя совпадает со старым — перезаписываем; если нет — старый тоже
+    # бэкапим, чтобы не плодить разные копии.
+    if out_path != svod_path and svod_path.exists():
+        make_backup(svod_path, log=log)
+    _save_with_backup(out_wb, out_path, log=log)
+    return out_path
 
 
 # ---------------------------------------------------------------- ТОЧКА ВХОДА
@@ -1396,19 +1835,48 @@ def _print_norm_report(stats: NormStats, dry_run: bool) -> None:
                 print(f"     →  {_short(ch['n_after']) or '(пусто)'}")
 
 
+STAGE_CHOICES = (
+    "all",         # полная пересборка с нуля (по умолчанию)
+    "merge",       # только объединение проектов (без сортировки/TOC/Ганта/высот)
+    "sort",        # перечитать существующий сводник и переставить по приоритетам
+    "normalize",   # только нормализация текста в готовом своднике
+    "toc",         # только перегенерация оглавления
+    "heights",     # только фиксация высот и wrap_text
+    "gantt",       # только перестроить лист «Диаграмма»
+    "restore",     # откатить сводник к последней резервной копии
+)
+
+
+def _require_existing_svod(log=print) -> Path:
+    """Возвращает путь к существующему своднику в корне или падает с понятной
+    ошибкой."""
+    path = find_existing_svod(ROOT)
+    if path is None:
+        raise RuntimeError(
+            f"В папке {ROOT} не найден файл «{SVOD_FILE_PREFIX} …xlsx».\n"
+            f"Сначала выполните стадию «merge» или «all»."
+        )
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Сборщик сводного графика ремонтов ЛЭП и сетевого оборудования."
     )
+    parser.add_argument("--stage", choices=STAGE_CHOICES, default="all",
+                        help="Какую стадию выполнить. По умолчанию «all» — "
+                             "полная пересборка из проектов.")
     parser.add_argument("--year", type=int, default=None,
                         help="Год в имени выходного файла (по умолчанию — из дат проекта или текущий).")
     parser.add_argument("--no-normalize", action="store_true",
-                        help="Отключить текстовую нормализацию полей H и N.")
+                        help="Отключить текстовую нормализацию полей H и N "
+                             "(применяется к «all», «merge», «sort»).")
     parser.add_argument("--collapse-preamble", action="store_true",
                         help="Сворачивать преамбулы «Вывод в ремонт … для проведения …» "
                              "в краткую форму «<Вид ремонта> Y» (опытное правило).")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Ничего не сохранять — только показать, что будет изменено.")
+                        help="Ничего не сохранять — только показать, что будет изменено "
+                             "(работает для «all» и «merge»).")
     args = parser.parse_args()
 
     opts = NormOptions(
@@ -1418,76 +1886,79 @@ def main():
     )
     stats = NormStats()
 
-    p_prio = find_file(FILE_PRIO)
-    p_arkh = find_file(FILE_ARKH)
-    p_komi = find_file(FILE_KOMI)
-
-    if not p_prio:
-        print(f"ОШИБКА: не найден файл справочника «{FILE_PRIO}».")
-        print(f"Положите его в папку: {ROOT}")
-        sys.exit(1)
-
-    if not p_arkh and not p_komi:
-        print(f"ОШИБКА: не найдены ни «{FILE_ARKH}», ни «{FILE_KOMI}».")
-        print(f"Положите хотя бы один из них в папку: {ROOT}")
-        sys.exit(1)
-
-    print("Найдены файлы:")
-    print(f"  • {p_prio}")
-    if p_arkh: print(f"  • {p_arkh}")
-    if p_komi: print(f"  • {p_komi}")
-
-    priority = load_priority(p_prio)
-
-    default_year = args.year if args.year else datetime.now().year
-    records: list[dict] = []
-    ws_arkh = ws_komi = None
-
-    if p_arkh:
-        wb_arkh = openpyxl.load_workbook(p_arkh)
-        ws_arkh = wb_arkh["Page1"] if "Page1" in wb_arkh.sheetnames else wb_arkh.active
-        validate_project_template(ws_arkh, p_arkh.name)
-        records += extract_records(ws_arkh, "Арх", default_year, "arkh")
-
-    if p_komi:
-        wb_komi = openpyxl.load_workbook(p_komi)
-        ws_komi = wb_komi["Page1"] if "Page1" in wb_komi.sheetnames else wb_komi.active
-        validate_project_template(ws_komi, p_komi.name)
-        records += extract_records(ws_komi, "Коми", default_year, "komi")
-
-    print(f"Всего строк оборудования: {len(records)}")
-
-    # если Коми нет — используем шаблон из Арх
-    template_ws = ws_komi or ws_arkh
-
-    month, year = pick_month_year(records, args.year)
-    print(f"Месяц сводного: {RU_MONTHS_NOM[month]} {year}")
-
-    out_wb = build_output(priority, records, template_ws, ws_arkh, month, year,
-                          opts, stats)
-
-    out_name = (
-        f"Сводный график ремонтов ЛЭП и сетевого оборудования "
-        f"на {RU_MONTHS_NOM[month]} {year} г.xlsx"
-    )
-    out_path = ROOT / out_name
-
-    _print_norm_report(stats, dry_run=opts.dry_run)
-
-    if opts.dry_run:
-        print()
-        print("[--dry-run] Итоговый файл не сохранён.")
-        return
-
     try:
-        out_wb.save(out_path)
-    except PermissionError:
-        print(f"ОШИБКА: не удаётся сохранить «{out_path.name}» — вероятно, файл открыт в Excel.")
-        print("Закройте его и запустите скрипт ещё раз.")
-        sys.exit(2)
+        if args.stage == "all":
+            if opts.dry_run:
+                # «Сухой прогон» собираем в памяти, но не сохраняем.
+                priority, records, tws, month, year = _load_inputs(
+                    ROOT, args.year, log=print)
+                build_output(priority, records, tws, None, month, year,
+                             opts, stats)
+                _print_norm_report(stats, dry_run=True)
+                print()
+                print("[--dry-run] Итоговый файл не сохранён.")
+                return
+            out_path = stage_full_rebuild(
+                ROOT, args.year, opts, stats,
+                apply_sort=True, apply_toc=True,
+                apply_heights=True, apply_gantt=True,
+            )
+            _print_norm_report(stats, dry_run=False)
+            print(f"\nГотово: {out_path}")
 
-    print()
-    print(f"Готово: {out_path}")
+        elif args.stage == "merge":
+            # Чистое объединение: классификация без приоритетов, без TOC/высот/Ганта.
+            out_path = stage_full_rebuild(
+                ROOT, args.year, opts, stats,
+                apply_sort=False, apply_toc=False,
+                apply_heights=False, apply_gantt=False,
+            )
+            _print_norm_report(stats, dry_run=False)
+            print(f"\nГотово: {out_path}")
+
+        elif args.stage == "sort":
+            svod = _require_existing_svod()
+            out_path = stage_rebuild_from_existing(
+                svod, args.year, opts, stats, log=print)
+            _print_norm_report(stats, dry_run=False)
+            print(f"\nГотово: {out_path}")
+
+        elif args.stage == "normalize":
+            svod = _require_existing_svod()
+            stage_normalize_inplace(svod, opts, stats, log=print)
+            _print_norm_report(stats, dry_run=False)
+
+        elif args.stage == "toc":
+            svod = _require_existing_svod()
+            stage_build_toc_inplace(svod, log=print)
+
+        elif args.stage == "heights":
+            svod = _require_existing_svod()
+            stage_set_heights_inplace(svod, log=print)
+
+        elif args.stage == "gantt":
+            svod = _require_existing_svod()
+            stage_build_gantt_inplace(svod,
+                                      args.year or datetime.now().year,
+                                      log=print)
+
+        elif args.stage == "restore":
+            svod = find_existing_svod(ROOT)
+            if svod is None:
+                # Нечего откатывать в корне — попробуем восстановить по любой
+                # копии: возьмём ту, к чьему имени больше всего копий.
+                raise RuntimeError(
+                    f"В папке {ROOT} не найден свод. Сначала положите файл "
+                    f"«{SVOD_FILE_PREFIX} …xlsx» или запустите стадию «merge»/"
+                    f"«all»."
+                )
+            restored = restore_latest_backup(svod, log=print)
+            if restored is None:
+                sys.exit(4)
+
+    except RuntimeError as e:
+        print(f"ОШИБКА: {e}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
