@@ -139,6 +139,22 @@ BACKUP_DIR = ROOT / "backups"
 SVOD_FILE_PREFIX = "Сводный график ремонтов"
 
 
+@dataclass
+class ProjectLayout:
+    """Распознанная раскладка экспорта ПК «Ремонты» на листе проекта.
+
+    Поля заполняются автоматически функцией `detect_project_layout` и
+    позволяют читать проекты с разным числом строк шапки и смещёнными
+    колонками дат / вида ремонта."""
+    header_last: int = 6
+    col_name: int = 1
+    col_start: int = 6
+    col_end: int = 7
+    col_repair: int = 14
+    table_cols: int = TABLE_COLS
+    sheet_title: str = "Page1"
+
+
 # ------------------------------------------------------------------ УТИЛИТЫ --
 
 def find_file(name: str) -> Path:
@@ -185,46 +201,138 @@ def _cell_text_with_merges(ws: Worksheet, row: int, col: int) -> str:
     return ""
 
 
-def validate_project_template(ws: Worksheet, filename: str) -> None:
-    """Проверяет, что лист похож на экспорт ПК «Ремонты». Падает с понятным
-    сообщением, если формат не распознан."""
+def _hdr_text(ws: Worksheet, row: int, col: int) -> str:
+    return re.sub(r"\s+", " ", _cell_text_with_merges(ws, row, col)).strip().lower()
+
+
+def detect_project_layout(ws: Worksheet, filename: str = "") -> ProjectLayout:
+    """Автоопределение раскладки экспорта ПК «Ремонты».
+
+    Поддерживаются варианты с разным числом строк шапки (например 5–6 или
+    3–4), другим именем листа и смещёнными колонками «Начало/Окончание» и
+    «Вид ремонта» — главное, чтобы в шапке были узнаваемые подписи."""
+    layout = ProjectLayout(sheet_title=ws.title)
+
+    header_last: int | None = None
+    start_cols: list[int] = []
+    end_cols: list[int] = []
+
+    scan_hi = min(25, ws.max_row + 1)
+    for r in range(1, scan_hi):
+        row_starts: list[int] = []
+        row_ends: list[int] = []
+        for c in range(1, TABLE_COLS + 1):
+            t = _hdr_text(ws, r, c)
+            if not t:
+                continue
+            if "начало" in t:
+                row_starts.append(c)
+            if "окончан" in t:
+                row_ends.append(c)
+        if row_starts and row_ends:
+            header_last = r
+            start_cols = row_starts
+            end_cols = row_ends
+
+    if header_last is None:
+        # Запасной вариант: последняя строка блока с «наименован» + «разрешен».
+        name_row = None
+        for r in range(1, scan_hi):
+            for c in range(1, TABLE_COLS + 1):
+                if "наименован" in _hdr_text(ws, r, c):
+                    name_row = r
+                    break
+            if name_row is not None:
+                break
+        header_last = (name_row + 1) if name_row else 6
+
+    layout.header_last = header_last
+
+    if start_cols:
+        layout.col_start = start_cols[0]
+        later_ends = [c for c in end_cols if c > layout.col_start]
+        layout.col_end = later_ends[0] if later_ends else layout.col_start + 1
+
+    name_found = False
+    repair_found = False
+    for r in range(max(1, header_last - 3), header_last + 1):
+        for c in range(1, TABLE_COLS + 1):
+            t = _hdr_text(ws, r, c)
+            if not t:
+                continue
+            if not name_found and "наименован" in t:
+                layout.col_name = c
+                name_found = True
+            if not repair_found and (
+                    ("вид" in t and "ремонт" in t)
+                    or ("аварийн" in t and "готов" in t)):
+                layout.col_repair = c
+                repair_found = True
+
+    # Ширина таблицы — по самому широкому однострочному merge в данных.
+    for r in range(header_last + 1, min(header_last + 80, ws.max_row + 1)):
+        for mr in ws.merged_cells.ranges:
+            if (mr.min_row == r and mr.max_row == r
+                    and mr.min_col == 1 and mr.max_col >= layout.table_cols):
+                layout.table_cols = max(layout.table_cols, mr.max_col)
+
+    return layout
+
+
+def layout_looks_valid(layout: ProjectLayout) -> bool:
+    return (
+        layout.header_last >= 2
+        and layout.col_name >= 1
+        and layout.col_start >= 1
+        and layout.col_end > layout.col_start
+    )
+
+
+def validate_project_layout(layout: ProjectLayout, filename: str) -> None:
+    """Проверяет, что раскладка похожа на экспорт ПК «Ремонты»."""
     errors: list[str] = []
-
-    # 1. Имя листа.
-    if ws.title != "Page1":
+    if not layout_looks_valid(layout):
         errors.append(
-            f"ожидается лист с именем «Page1», найден «{ws.title}»"
+            "не удалось найти строку шапки с колонками «Начало» и «Окончание»"
         )
-
-    # 2. Шапка и таблица: A6 — «Наименование оборудования», F6/G6 — «Дата ...»,
-    #    N6 — «Вид ремонта». Допускаем расхождения в пробелах/регистре.
-    def hdr(col: int) -> str:
-        return re.sub(r"\s+", " ", _cell_text_with_merges(ws, 6, col)).strip().lower()
-
-    a = hdr(1)
-    f = hdr(6)
-    g = hdr(7)
-    n = hdr(14)
-
-    if "наименован" not in a:
-        errors.append("в ячейке A6 не найдено «Наименование оборудования»")
-    if not ("дата" in f or "начал" in f or "начал" in g):
-        errors.append("в колонках F6/G6 не найдены «Дата начала/окончания»")
-    if not ("вид" in n or "ремонт" in n):
-        errors.append("в ячейке N6 не найдено «Вид ремонта»")
+    if layout.col_name < 1:
+        errors.append("не найдена колонка «Наименование …»")
+    if layout.col_repair < 1:
+        errors.append("не найдена колонка «Вид ремонта / аварийная готовность»")
 
     if errors:
         print()
-        print(f"ОШИБКА: файл «{filename}» выглядит не как экспорт ПК «Ремонты».")
+        print(f"ОШИБКА: файл «{filename}» не похож на экспорт ПК «Ремонты».")
         for e in errors:
             print(f"  • {e}")
         print()
-        print("Ожидаемый формат: лист «Page1», шапка в строках 1–6, заголовок")
-        print("  таблицы: A «Наименование оборудования», F/G «Дата начала/"
-              "окончания», N «Вид ремонта».")
-        print("Если ПК «Ремонты» выдал новый формат — сообщите разработчику, "
-              "приложив файл.")
+        print("Ожидается таблица с шапкой, где есть:")
+        print("  • «Наименование …» (объект / оборудование);")
+        print("  • «Начало (дата)» и «Окончание (дата)»;")
+        print("  • «Вид ремонта» или «аварийная готовность».")
+        print("Имя листа может отличаться от «Page1» — скрипт подберёт лист сам.")
+        print("Если формат всё равно не распознан — приложите файл разработчику.")
         sys.exit(3)
+
+
+def validate_project_template(ws: Worksheet, filename: str) -> ProjectLayout:
+    """Проверяет лист и возвращает распознанную раскладку."""
+    layout = detect_project_layout(ws, filename)
+    validate_project_layout(layout, filename)
+    return layout
+
+
+def find_project_sheet(wb: openpyxl.Workbook) -> Worksheet:
+    """Выбирает лист с данными проекта: «Page1» или первый узнаваемый."""
+    if "Page1" in wb.sheetnames:
+        ws = wb["Page1"]
+        if layout_looks_valid(detect_project_layout(ws)):
+            return ws
+    for name in wb.sheetnames:
+        ws = wb[name]
+        if layout_looks_valid(detect_project_layout(ws)):
+            return ws
+    return wb.active
 
 
 def month_day_count(year: int, month: int) -> int:
@@ -292,8 +400,11 @@ def copy_column_widths(src_ws: Worksheet, dst_ws: Worksheet,
 
 # -------------------------------------------------------- ПАРСИНГ ПРОЕКТА ----
 
-def is_section_row(ws: Worksheet, row: int, ncols: int = TABLE_COLS) -> bool:
+def is_section_row(ws: Worksheet, row: int,
+                   ncols: int | None = None) -> bool:
     """Строка-подзаголовок: объединена на всю ширину (A..Y)."""
+    if ncols is None:
+        ncols = TABLE_COLS
     for mr in ws.merged_cells.ranges:
         if (mr.min_row == row and mr.max_row == row
                 and mr.min_col == 1 and mr.max_col >= ncols):
@@ -310,16 +421,18 @@ def is_equipment_row(ws: Worksheet, row: int) -> bool:
     return not is_section_row(ws, row)
 
 
-def find_data_bounds(ws: Worksheet, ncols: int = TABLE_COLS) -> tuple[int, int, int]:
+def find_data_bounds(ws: Worksheet, ncols: int = TABLE_COLS,
+                     layout: ProjectLayout | None = None
+                     ) -> tuple[int, int, int]:
     """Возвращает (header_last_row, data_last_row, signatures_start_row).
 
     Правила:
-      * Шапка таблицы занимает строки 1..6 — это константа формата проекта.
+      * Шапка таблицы — до `layout.header_last` (по умолчанию 6).
       * Данные — строки с непустым A (секции или оборудование).
       * Подписи — начинаются после последней «data»-строки, могут содержать
         пустые промежутки между подписывающими лицами.
     """
-    header_last = 6
+    header_last = layout.header_last if layout else 6
     last_data_row = header_last
     for r in range(header_last + 1, ws.max_row + 1):
         a = ws.cell(r, 1).value
@@ -345,26 +458,29 @@ def find_data_bounds(ws: Worksheet, ncols: int = TABLE_COLS) -> tuple[int, int, 
 
 
 def extract_records(ws: Worksheet, rdu: str, default_year: int,
-                    src_key: str) -> list[dict]:
+                    src_key: str,
+                    layout: ProjectLayout | None = None) -> list[dict]:
     """Возвращает список записей с исходных строк оборудования.
 
     Каждая запись содержит ссылку на исходный лист и номер строки — это
     позволит затем скопировать её «как есть» (со всеми стилями и объединениями).
     """
-    header_last, data_last, sig_start = find_data_bounds(ws)
+    if layout is None:
+        layout = detect_project_layout(ws)
+    header_last, data_last, _sig_start = find_data_bounds(ws, layout=layout)
     recs: list[dict] = []
     current_section = None
     for r in range(header_last + 1, data_last + 1):
-        a = ws.cell(r, 1).value
+        a = ws.cell(r, layout.col_name).value
         if a is None or (isinstance(a, str) and a.strip() == ""):
             continue
         name = str(a).strip()
-        if is_section_row(ws, r):
+        if is_section_row(ws, r, layout.table_cols):
             current_section = name
             continue
         # строка оборудования
-        start_raw = ws.cell(r, 6).value
-        end_raw   = ws.cell(r, 7).value
+        start_raw = ws.cell(r, layout.col_start).value
+        end_raw   = ws.cell(r, layout.col_end).value
         start = parse_day_month(start_raw, default_year)
         end   = parse_day_month(end_raw,   default_year)
         recs.append({
@@ -376,6 +492,7 @@ def extract_records(ws: Worksheet, rdu: str, default_year: int,
             "src_ws":  ws,
             "src_row": r,
             "src_key": src_key,                    # 'arkh' / 'komi' для отладки
+            "layout":  layout,
         })
     return recs
 
@@ -607,13 +724,16 @@ def pick_month_year(records: list[dict], override_year: int | None) -> tuple[int
     return month, year
 
 
-def find_style_rows(ws_komi: Worksheet) -> dict:
+def find_style_rows(ws_komi: Worksheet,
+                    layout: ProjectLayout | None = None) -> dict:
     """Находит в проекте Коми РДУ подходящие строки-образцы для стилей."""
-    header_last, data_last, sig_start = find_data_bounds(ws_komi)
+    if layout is None:
+        layout = detect_project_layout(ws_komi)
+    header_last, data_last, sig_start = find_data_bounds(ws_komi, layout=layout)
     section_style_row = None
     equipment_style_row = None
     for r in range(header_last + 1, data_last + 1):
-        if section_style_row is None and is_section_row(ws_komi, r):
+        if section_style_row is None and is_section_row(ws_komi, r, layout.table_cols):
             section_style_row = r
         if equipment_style_row is None and is_equipment_row(ws_komi, r):
             equipment_style_row = r
@@ -625,6 +745,7 @@ def find_style_rows(ws_komi: Worksheet) -> dict:
         "sig_start": sig_start,
         "section_style_row": section_style_row,
         "equipment_style_row": equipment_style_row,
+        "layout": layout,
     }
 
 
@@ -676,15 +797,36 @@ def write_title(out_ws: Worksheet, month: int, year: int):
                     out_ws.cell(r, c).value = new
 
 
+def _apply_section_vertical_center(ws: Worksheet, row: int) -> None:
+    """Выравнивает текст заголовка/подзаголовка по центру строки."""
+    cell = ws.cell(row, 1)
+    al = cell.alignment
+    cell.alignment = Alignment(
+        horizontal=al.horizontal or "left",
+        vertical="center",
+        text_rotation=al.text_rotation,
+        wrap_text=al.wrap_text,
+        shrink_to_fit=al.shrink_to_fit,
+        indent=al.indent,
+    )
+
+
 def write_style_row(out_ws: Worksheet, row: int, text: str,
                     src_ws: Worksheet, style_row: int,
-                    height: float | None = None):
+                    height: float | None = None,
+                    vertical_center: bool = True):
     """Пишет строку-заголовок/подзаголовок на всю ширину таблицы, копируя
     стиль из строки-образца проекта. Если указан `height` — принудительно
-    выставляет высоту строки (pt); иначе копирует высоту из образца."""
+    выставляет высоту строки (pt); иначе копирует высоту из образца.
+
+    `vertical_center=True` — текст по центру строки (как в ручном своднике
+    для «ПС 220 кВ Микунь» и аналогичных подзаголовков)."""
     for c in range(1, TABLE_COLS + 1):
         copy_cell_style(src_ws.cell(style_row, c), out_ws.cell(row, c))
-    out_ws.cell(row, 1).value = text
+    cell = out_ws.cell(row, 1)
+    cell.value = text
+    if vertical_center:
+        _apply_section_vertical_center(out_ws, row)
     rng = f"A{row}:{LAST_COL_LETTER}{row}"
     try:
         out_ws.merge_cells(rng)
@@ -1615,6 +1757,7 @@ def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
     объектам (ПС/Электростанции) становятся current_section — как и в
     исходных проектах."""
     header_last, data_last, _sig_start = find_data_bounds(ws_svod)
+    layout = detect_project_layout(ws_svod)
     recs: list[dict] = []
     current_section = ""
     group_label_lc = {v.strip().lower() for v in GROUP_LABELS.values()}
@@ -1644,8 +1787,8 @@ def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
         elif "коми" in sec_lc:
             rdu = "Коми"
 
-        start_raw = ws_svod.cell(r, 6).value
-        end_raw = ws_svod.cell(r, 7).value
+        start_raw = ws_svod.cell(r, layout.col_start).value
+        end_raw = ws_svod.cell(r, layout.col_end).value
         start = parse_day_month(start_raw, default_year)
         end = parse_day_month(end_raw, default_year)
 
@@ -1768,6 +1911,7 @@ def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
             ws.row_dimensions[r].height = ROW_HEIGHT_SECTION
         else:
             ws.row_dimensions[r].height = ROW_HEIGHT_SUBSECTION
+        _apply_section_vertical_center(ws, r)
 
     # wrap_text для H/N в строках данных + пересчёт высоты по тексту.
     for r in range(header_last + 1, data_last + 1):
@@ -1863,15 +2007,29 @@ def _load_inputs(root: Path, year_hint: int | None, log=print
 
     if p_arkh:
         wb_arkh = openpyxl.load_workbook(p_arkh)
-        ws_arkh = wb_arkh["Page1"] if "Page1" in wb_arkh.sheetnames else wb_arkh.active
-        validate_project_template(ws_arkh, p_arkh.name)
-        records += extract_records(ws_arkh, "Арх", default_year, "arkh")
+        ws_arkh = find_project_sheet(wb_arkh)
+        layout_arkh = validate_project_template(ws_arkh, p_arkh.name)
+        log(
+            f"  формат «{p_arkh.name}»: лист «{layout_arkh.sheet_title}», "
+            f"шапка до строки {layout_arkh.header_last}, "
+            f"даты {get_column_letter(layout_arkh.col_start)}/"
+            f"{get_column_letter(layout_arkh.col_end)}"
+        )
+        records += extract_records(
+            ws_arkh, "Арх", default_year, "arkh", layout_arkh)
 
     if p_komi:
         wb_komi = openpyxl.load_workbook(p_komi)
-        ws_komi = wb_komi["Page1"] if "Page1" in wb_komi.sheetnames else wb_komi.active
-        validate_project_template(ws_komi, p_komi.name)
-        records += extract_records(ws_komi, "Коми", default_year, "komi")
+        ws_komi = find_project_sheet(wb_komi)
+        layout_komi = validate_project_template(ws_komi, p_komi.name)
+        log(
+            f"  формат «{p_komi.name}»: лист «{layout_komi.sheet_title}», "
+            f"шапка до строки {layout_komi.header_last}, "
+            f"даты {get_column_letter(layout_komi.col_start)}/"
+            f"{get_column_letter(layout_komi.col_end)}"
+        )
+        records += extract_records(
+            ws_komi, "Коми", default_year, "komi", layout_komi)
 
     log(f"Всего строк оборудования: {len(records)}")
     template_ws = ws_komi or ws_arkh
