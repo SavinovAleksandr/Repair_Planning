@@ -1,284 +1,135 @@
 @echo off
-
 chcp 65001 >nul 2>nul
-
-setlocal EnableExtensions
-
-
-
-rem =============================================================================
-
-rem  Запуск сборщика сводного графика ремонтов (Windows).
-
-rem
-
-rem  Двойной клик — GUI (gui_svod.py).
-
-rem  run_svod.bat --stage all  — консольный режим (build_svod.py).
-
-rem  run_svod.bat --check      — проверка Python и зависимостей.
-
-rem  run_svod.bat --setup      — установка openpyxl.
-
-rem =============================================================================
-
-
-
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-
-
-if /i "%~1"=="--check" goto :check
-
-if /i "%~1"=="--setup" goto :setup
-
-
+if /i "%~1"=="--check" goto check
+if /i "%~1"=="--setup" goto setup
 
 if "%~1"=="" (
-
     set "SCRIPT=gui_svod.py"
-
     set "GUI_MODE=1"
-
 ) else (
-
     set "SCRIPT=build_svod.py"
-
     set "GUI_MODE=0"
-
 )
-
-
 
 call :find_python
-
-if errorlevel 1 goto :fail
-
-
-
+if errorlevel 1 goto fail
 call :ensure_deps
+if errorlevel 1 goto fail
 
-if errorlevel 1 goto :fail
+if "!GUI_MODE!"=="1" goto run_gui
+goto run_cli
 
-
-
-echo.
-
-echo Запуск: "%PYEXE%" "%SCRIPT%" %*
-
-echo.
-
-
-
-"%PYEXE%" "%SCRIPT%" %*
-
-set "RC=%ERRORLEVEL%"
-
-
-
-if "%GUI_MODE%"=="1" (
-
-    if not "%RC%"=="0" (
-
-        echo.
-
-        echo [!] GUI завершился с ошибкой (код %RC%). См. сообщение выше.
-
-        pause
-
-    )
-
-    exit /b %RC%
-
+:run_gui
+set "PYW=!PYEXE:python.exe=pythonw.exe!"
+if /i not "!PYW!"=="!PYEXE!" if exist "!PYW!" (
+    echo GUI: "!PYW!" "%SCRIPT%"
+    start "" "!PYW!" "%SCRIPT%"
+    exit /b 0
 )
+echo GUI: "!PYEXE!" "%SCRIPT%"
+"!PYEXE!" "%SCRIPT%"
+set "RC=!ERRORLEVEL!"
+if not "!RC!"=="0" goto fail_with_code
+exit /b 0
 
-
-
+:run_cli
 echo.
-
-if not "%RC%"=="0" (
-
-    echo [!] Сборка завершилась с ошибкой (код %RC%).
-
-) else (
-
-    echo [OK] Готово. Файл сохранён рядом с этим bat.
-
+echo Run: "!PYEXE!" "%SCRIPT%" %*
+echo.
+"!PYEXE!" "%SCRIPT%" %*
+set "RC=!ERRORLEVEL!"
+echo.
+if not "!RC!"=="0" (
+    echo [!] Error code !RC!
+    pause
+    exit /b !RC!
 )
-
+echo [OK] Done.
 pause
-
-exit /b %RC%
-
-
-
-
+exit /b 0
 
 :check
-
-echo === Проверка окружения ===
-
-echo Папка: %CD%
-
+echo === Environment check ===
+echo Folder: %CD%
 echo.
-
 call :find_python
-
-if errorlevel 1 goto :fail
-
-echo Python: OK
-
-"%PYEXE%" --version
-
+if errorlevel 1 goto fail
+echo Python OK: "!PYEXE!"
+"!PYEXE!" --version
 echo.
-
 set "GUI_MODE=1"
-
 call :ensure_deps
-
-if errorlevel 1 goto :fail
-
+if errorlevel 1 goto fail
 echo.
-
-echo Все проверки пройдены. Можно запускать run_svod.bat двойным кликом.
-
+echo All checks passed.
 pause
-
 exit /b 0
-
-
-
-
 
 :setup
-
-echo === Установка зависимостей ===
-
+echo === Installing dependencies ===
 call :find_python
-
-if errorlevel 1 goto :fail
-
-"%PYEXE%" -m pip install --upgrade pip
-
-"%PYEXE%" -m pip install -r "%~dp0requirements.txt"
-
-if errorlevel 1 goto :fail
-
+if errorlevel 1 goto fail
+"!PYEXE!" -m pip install --upgrade pip
+"!PYEXE!" -m pip install -r "%~dp0requirements.txt"
+if errorlevel 1 goto fail
 echo.
-
-echo Готово. Запустите: run_svod.bat --check
-
+echo Done. Run: run_svod.bat --check
 pause
-
 exit /b 0
-
-
-
-
 
 :find_python
-
 set "PYEXE="
-
 where py >nul 2>nul
-
 if not errorlevel 1 (
-
     for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
-
-    if defined PYEXE exit /b 0
-
 )
-
+if defined PYEXE exit /b 0
 where python >nul 2>nul
-
 if not errorlevel 1 (
-
     for /f "delims=" %%i in ('python -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
-
-    if defined PYEXE exit /b 0
-
 )
-
+if defined PYEXE exit /b 0
 where python3 >nul 2>nul
-
 if not errorlevel 1 (
-
     for /f "delims=" %%i in ('python3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
-
-    if defined PYEXE exit /b 0
-
 )
-
+if defined PYEXE exit /b 0
 echo.
-
-echo [ОШИБКА] На компьютере не найден Python 3.
-
-echo.
-
-echo  1. Скачайте Python 3.10+ с https://www.python.org/downloads/
-
-echo  2. При установке обязательно отметьте "Add python.exe to PATH".
-
-echo  3. Запустите: run_svod.bat --setup
-
-echo  4. Затем: run_svod.bat --check
-
+echo [ERROR] Python 3 not found.
+echo 1. Install from https://www.python.org/downloads/
+echo 2. Check "Add python.exe to PATH"
+echo 3. Run: run_svod.bat --setup
 exit /b 1
-
-
-
-
 
 :ensure_deps
-
-"%PYEXE%" -c "import openpyxl" >nul 2>nul
-
+"!PYEXE!" -c "import openpyxl" >nul 2>nul
 if errorlevel 1 (
-
     echo.
-
-    echo [ОШИБКА] Не установлен пакет openpyxl (нужен для Excel).
-
-    echo Попробуйте: run_svod.bat --setup
-
-    echo Или вручную: "%PYEXE%" -m pip install openpyxl
-
+    echo [ERROR] Package openpyxl is missing.
+    echo Run: run_svod.bat --setup
     exit /b 1
-
 )
-
-if "%GUI_MODE%"=="1" (
-
-    "%PYEXE%" -c "import tkinter" >nul 2>nul
-
-    if errorlevel 1 (
-
-        echo.
-
-        echo [ОШИБКА] Не найден tkinter (нужен для окна с кнопками).
-
-        echo Переустановите Python с python.org и отметьте "tcl/tk and IDLE".
-
-        echo Либо запускайте без GUI: run_svod.bat --stage all
-
-        exit /b 1
-
-    )
-
+if not "!GUI_MODE!"=="1" exit /b 0
+"!PYEXE!" -c "import tkinter" >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo [ERROR] tkinter is missing (needed for GUI).
+    echo Reinstall Python with "tcl/tk and IDLE" enabled.
+    echo Or use CLI: run_svod.bat --stage all
+    exit /b 1
 )
-
 exit /b 0
 
-
-
-
+:fail_with_code
+echo.
+echo [!] Failed with code !RC!
+goto fail
 
 :fail
-
 echo.
-
-pause
-
+echo Press any key to close...
+pause >nul
 exit /b 1
-
