@@ -1,4 +1,8 @@
 @echo off
-rem Diagnostic launcher: window stays open. Use if run_svod.bat closes instantly.
+
+rem Diagnostic launcher: console stays open, full error output.
+
 cd /d "%~dp0"
-cmd /k run_svod.bat %*
+
+cmd /k "%~dp0run_svod.bat" %*
+

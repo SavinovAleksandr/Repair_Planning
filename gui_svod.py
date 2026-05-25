@@ -31,16 +31,22 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parent
+
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
 import build_svod as bs
 
+# Всегда работаем из папки gui_svod.py (важно для pythonw / двойного клика).
+os.chdir(ROOT_DIR)
+bs.ROOT = ROOT_DIR
 
 # ------------------------------------------------------------------ КОНСТАНТЫ
 
 PAD = 8
-ROOT_DIR = bs.ROOT
+ERROR_LOG = ROOT_DIR / "gui_error.log"
+LOG_FONT = ("Consolas", 10) if sys.platform.startswith("win") else ("Menlo", 10)
 
 
 # ------------------------------------------------------------------ ХЕЛПЕРЫ
@@ -197,7 +203,7 @@ class SvodApp(tk.Tk):
         logf = ttk.LabelFrame(self, text="Лог", padding=(PAD, PAD, PAD, PAD))
         logf.pack(fill=tk.BOTH, expand=True, padx=PAD, pady=PAD)
         self.log = scrolledtext.ScrolledText(
-            logf, wrap="word", height=14, font=("Menlo", 10))
+            logf, wrap="word", height=14, font=LOG_FONT)
         self.log.pack(fill=tk.BOTH, expand=True)
         self.log.configure(state="disabled")
 
@@ -505,9 +511,33 @@ class SvodApp(tk.Tk):
             self._push("log", f"  • {label}: {n}")
 
 
+def _report_startup_error(text: str) -> None:
+    """Пишет ошибку в gui_error.log и показывает окно (если tkinter жив)."""
+    try:
+        ERROR_LOG.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Ошибка запуска",
+            f"Не удалось открыть окно программы.\n\n"
+            f"Подробности сохранены в:\n{ERROR_LOG}\n\n"
+            f"{text[:800]}",
+        )
+        root.destroy()
+    except Exception:
+        pass
+
+
 def main() -> None:
-    app = SvodApp()
-    app.mainloop()
+    try:
+        app = SvodApp()
+        app.mainloop()
+    except Exception:
+        _report_startup_error(traceback.format_exc())
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
