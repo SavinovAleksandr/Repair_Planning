@@ -714,6 +714,10 @@ def pick_month_year(records: list[dict], override_year: int | None) -> tuple[int
             y, m, _ = r["start"]
             months[m] += 1
             years[y] += 1
+        elif r["end"]:
+            y, m, _ = r["end"]
+            months[m] += 1
+            years[y] += 1
     month = months.most_common(1)[0][0] if months else datetime.now().month
     if override_year:
         year = override_year
@@ -722,6 +726,29 @@ def pick_month_year(records: list[dict], override_year: int | None) -> tuple[int
     else:
         year = datetime.now().year
     return month, year
+
+
+def infer_schedule_from_filename(path: Path) -> tuple[int | None, int | None]:
+    """Из имени «… на май 2026 г.xlsx» извлекает (month, year) или (None, None)."""
+    name = path.stem.lower()
+    year: int | None = None
+    m_year = re.search(r"(?<![0-9])(\d{4})(?![0-9])", name)
+    if m_year:
+        year = int(m_year.group(1))
+    month: int | None = None
+    for i, mn in enumerate(RU_MONTHS_NOM):
+        if i == 0:
+            continue
+        if mn in name:
+            month = i
+            break
+    return month, year
+
+
+def default_year_for_svod(svod_path: Path, year_hint: int | None = None) -> int:
+    """Год для разбора дат вида «12.05.» в своднике."""
+    _fn_month, fn_year = infer_schedule_from_filename(svod_path)
+    return fn_year or year_hint or datetime.now().year
 
 
 def find_style_rows(ws_komi: Worksheet,
@@ -1485,7 +1512,14 @@ def build_gantt_sheet(out_wb: openpyxl.Workbook, gantt_items: list[dict],
 
         n_text = ""
         try:
-            n_text = str(rec["src_ws"].cell(rec["src_row"], 14).value or "")
+            src_ws = rec["src_ws"]
+            src_row = rec["src_row"]
+            col_n = rec.get("layout")
+            if isinstance(col_n, ProjectLayout):
+                col_n = col_n.col_repair
+            else:
+                col_n = detect_project_layout(src_ws).col_repair
+            n_text = _cell_text_with_merges(src_ws, src_row, col_n)
         except Exception:
             pass
         vid = _vid_remonta(n_text)
@@ -1787,8 +1821,8 @@ def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
         elif "коми" in sec_lc:
             rdu = "Коми"
 
-        start_raw = ws_svod.cell(r, layout.col_start).value
-        end_raw = ws_svod.cell(r, layout.col_end).value
+        start_raw = _cell_text_with_merges(ws_svod, r, layout.col_start)
+        end_raw = _cell_text_with_merges(ws_svod, r, layout.col_end)
         start = parse_day_month(start_raw, default_year)
         end = parse_day_month(end_raw, default_year)
 
@@ -1801,6 +1835,7 @@ def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
             "src_ws": ws_svod,
             "src_row": r,
             "src_key": src_key,
+            "layout": layout,
         })
     return recs
 
@@ -1945,22 +1980,35 @@ def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
     _save_with_backup(wb, svod_path, log=log)
 
 
-def stage_build_gantt_inplace(svod_path: Path, default_year: int,
+def stage_build_gantt_inplace(svod_path: Path, default_year: int | None = None,
                               log=print) -> None:
-    """Пересоздаёт лист «Диаграмма» в уже существующем своднике."""
+    """Пересоздаёт лист «Диаграмма» в уже существующем своднике.
+
+    Читает актуальные даты начала/окончания (колонки F/G) прямо с Page1 —
+    после ручного переноса сроков в Excel достаточно запустить эту стадию
+    (GUI: «Обновить диаграмму Ганта» или чекбокс «Диаграмма Ганта»)."""
     log(f"Диаграмма Ганта: {svod_path.name}")
     wb = openpyxl.load_workbook(svod_path)
     if "Page1" not in wb.sheetnames:
         raise RuntimeError("В файле нет листа «Page1».")
     ws = wb["Page1"]
 
-    recs = extract_records_from_svod(ws, default_year=default_year)
-    # Классифицируем, чтобы gantt_items имели subgroup (для имени строки).
+    parse_year = default_year_for_svod(svod_path, default_year)
+    fn_month, fn_year = infer_schedule_from_filename(svod_path)
+    recs = extract_records_from_svod(ws, default_year=parse_year)
+    if not recs:
+        raise RuntimeError(
+            "На листе Page1 не найдено строк оборудования для диаграммы."
+        )
     for rec in recs:
         g, sub = classify(rec)
         rec["group"] = g
         rec["subgroup"] = sub or rec.get("section", "")
-    month, year = pick_month_year(recs, default_year if default_year else None)
+    month, year = pick_month_year(recs, fn_year or default_year)
+    if fn_month and not any(r.get("start") or r.get("end") for r in recs):
+        month = fn_month
+
+    log(f"  строк: {len(recs)}, шкала: {RU_MONTHS_NOM[month]} {year} г.")
 
     if GANTT_SHEET_NAME in wb.sheetnames:
         del wb[GANTT_SHEET_NAME]
@@ -2085,7 +2133,7 @@ def stage_rebuild_from_existing(svod_path: Path, year_hint: int | None,
         raise RuntimeError("В файле нет листа «Page1».")
     ws = wb["Page1"]
 
-    default_year = year_hint if year_hint else datetime.now().year
+    default_year = default_year_for_svod(svod_path, year_hint)
     records = extract_records_from_svod(ws, default_year=default_year)
     log(f"Строк оборудования в своднике: {len(records)}")
 
@@ -2251,9 +2299,7 @@ def main():
 
         elif args.stage == "gantt":
             svod = _require_existing_svod()
-            stage_build_gantt_inplace(svod,
-                                      args.year or datetime.now().year,
-                                      log=print)
+            stage_build_gantt_inplace(svod, args.year, log=print)
 
         elif args.stage == "restore":
             svod = find_existing_svod(ROOT)

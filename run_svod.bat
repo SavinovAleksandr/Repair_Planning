@@ -72,9 +72,17 @@ exit /b 0
 echo === Installing dependencies ===
 call :find_python
 if errorlevel 1 goto fail
+set "OFFLINE=%~dp0установка\wheels"
+if exist "%OFFLINE%\openpyxl-*.whl" (
+    echo Offline wheels found in установка\wheels
+    "!PYEXE!" -m pip install --no-index --find-links="%OFFLINE%" openpyxl
+    if not errorlevel 1 goto setup_ok
+    echo Offline install failed, trying online...
+)
 "!PYEXE!" -m pip install --upgrade pip
 "!PYEXE!" -m pip install -r "%~dp0requirements.txt"
 if errorlevel 1 goto fail
+:setup_ok
 echo.
 echo Done. Run: run_svod.bat --check
 pause

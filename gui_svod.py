@@ -157,6 +157,11 @@ class SvodApp(tk.Tk):
                         variable=self.var_gantt).grid(
             row=2, column=0, sticky="w", padx=(0, 16), pady=2)
 
+        btn_gantt = ttk.Button(
+            g2, text="Обновить диаграмму Ганта (после правки дат)",
+            command=self._on_refresh_gantt)
+        btn_gantt.grid(row=2, column=1, sticky="e", pady=2)
+
         btn_apply = ttk.Button(
             g2, text="Выполнить отмеченное",
             command=self._on_apply_selected,
@@ -381,10 +386,29 @@ class SvodApp(tk.Tk):
                 self._push("log", "→ Фиксация высот + wrap")
                 bs.stage_set_heights_inplace(svod, log=self._log_fn)
             if do_gantt and not do_sort:
-                self._push("log", "→ Диаграмма Ганта")
+                self._push("log", "→ Диаграмма Ганта (актуальные даты с Page1)")
                 bs.stage_build_gantt_inplace(
-                    svod, datetime.now().year, log=self._log_fn)
+                    svod, None, log=self._log_fn)
             self._report_norm(stats)
+
+        self._run_in_thread(run)
+
+    def _on_refresh_gantt(self) -> None:
+        """Перестроить только лист «Диаграмма» по текущим датам на Page1."""
+        svod = bs.find_existing_svod(ROOT_DIR)
+        if svod is None:
+            messagebox.showerror(
+                "Нет сводника",
+                f"В папке {ROOT_DIR} не найден «Сводный график …xlsx».",
+            )
+            return
+
+        def run():
+            self._push("log", "=== Обновление диаграммы Ганта ===")
+            self._push("log",
+                       "Читаю даты начала/окончания (F/G) с листа Page1…")
+            bs.stage_build_gantt_inplace(svod, None, log=self._log_fn)
+            self._push("log", "Готово. Откройте лист «Диаграмма» в своднике.")
 
         self._run_in_thread(run)
 
