@@ -1,322 +1,142 @@
 @echo off
-
 chcp 65001 >nul 2>nul
-
 setlocal EnableExtensions EnableDelayedExpansion
-
 cd /d "%~dp0"
-
 set "ROOT=%~dp0"
-
 set "ROOT=%ROOT:~0,-1%"
-
-
-
+set "LOG=%ROOT%\launch_debug.log"
 if /i "%~1"=="--check" goto check
-
 if /i "%~1"=="--setup" goto setup
-
-
-
-if "%~1"=="" (
-
-    set "SCRIPT=%ROOT%\gui_svod.py"
-
-    set "GUI_MODE=1"
-
-) else (
-
-    set "SCRIPT=%ROOT%\build_svod.py"
-
-    set "GUI_MODE=0"
-
-)
-
-
-
-call :find_python
-
+if not "%~1"=="" goto run_cli
+call :find_python_gui
 if errorlevel 1 goto fail
-
-call :ensure_deps
-
-if errorlevel 1 goto fail
-
-
-
-if "!GUI_MODE!"=="1" goto run_gui
-
-goto run_cli
-
-
-
-:run_gui
-
-rem НЕ используем «start» — иначе bat закрывается сразу и ошибки pythonw не видны.
-
-set "PYW=!PYEXE:python.exe=pythonw.exe!"
-
-if /i "!PYW!"=="!PYEXE!" set "PYW="
-
-if defined PYW if not exist "!PYW!" set "PYW="
-
-
-
-if defined PYW (
-
-    echo Starting GUI ^(pythonw^)...
-
-    "!PYW!" "!SCRIPT!"
-
-) else (
-
-    echo Starting GUI ^(python^)...
-
-    "!PYEXE!" "!SCRIPT!"
-
-)
-
+echo [%date% %time%] GUI "!PYEXE!" >> "%LOG%"
+"!PYEXE!" "%ROOT%\gui_svod.py"
 set "RC=!ERRORLEVEL!"
-
+echo [%date% %time%] GUI exit !RC! >> "%LOG%"
 if not "!RC!"=="0" goto gui_failed
-
 exit /b 0
-
-
-
 :gui_failed
-
 echo.
-
-echo [!] GUI failed with code !RC!
-
+echo [!] GUI failed, code !RC!
 if exist "%ROOT%\gui_error.log" (
-
     echo.
-
-    echo --- gui_error.log ---
-
     type "%ROOT%\gui_error.log"
-
-    echo --- end ---
-
 )
-
 echo.
-
-echo Try: run_svod_debug.bat
-
+echo Log: %LOG%
+echo Tip: double-click gui_svod.py or "Zapusk GUI.bat"
 goto fail
-
-
-
 :run_cli
-
-echo.
-
-echo Run: "!PYEXE!" "!SCRIPT!" %*
-
-echo.
-
-"!PYEXE!" "!SCRIPT!" %*
-
-set "RC=!ERRORLEVEL!"
-
-echo.
-
-if not "!RC!"=="0" (
-
-    echo [!] Error code !RC!
-
-    pause
-
-    exit /b !RC!
-
-)
-
-echo [OK] Done.
-
-pause
-
-exit /b 0
-
-
-
-:check
-
-echo === Environment check ===
-
-echo Folder: %CD%
-
-echo.
-
+set "SCRIPT=%ROOT%\build_svod.py"
+set "GUI_MODE=0"
 call :find_python
-
 if errorlevel 1 goto fail
-
-echo Python: "!PYEXE!"
-
-"!PYEXE!" --version
-
-echo.
-
-set "GUI_MODE=1"
-
 call :ensure_deps
-
 if errorlevel 1 goto fail
-
 echo.
-
-echo Testing GUI import...
-
-"!PYEXE!" -c "import os; os.chdir(r'%ROOT%'); import gui_svod; print('gui_svod OK')"
-
-if errorlevel 1 goto fail
-
+echo Run: "!PYEXE!" "!SCRIPT!" %*
 echo.
-
-echo All checks passed. Double-click run_svod.bat to open GUI.
-
+"!PYEXE!" "!SCRIPT!" %*
+set "RC=!ERRORLEVEL!"
+echo.
+if not "!RC!"=="0" (
+    echo [!] Error !RC!
+    pause
+    exit /b !RC!
+)
+echo [OK] Done.
 pause
-
 exit /b 0
-
-
-
+:check
+echo === Check ===
+echo Folder: %CD%
+call :find_python_gui
+if errorlevel 1 call :find_python
+if errorlevel 1 goto fail
+echo Python: "!PYEXE!"
+"!PYEXE!" --version
+set "GUI_MODE=1"
+call :ensure_deps
+if errorlevel 1 goto fail
+"!PYEXE!" -c "import os; os.chdir(r'%ROOT%'); import gui_svod; print('OK')"
+if errorlevel 1 goto fail
+echo All OK.
+pause
+exit /b 0
 :setup
-
-echo === Installing dependencies ===
-
 call :find_python
-
 if errorlevel 1 goto fail
-
-set "OFFLINE=%ROOT%\установка\wheels"
-
+set "OFFLINE=%ROOT%\install_wheels"
+if exist "%ROOT%\установка\wheels\openpyxl-*.whl" set "OFFLINE=%ROOT%\установка\wheels"
 if exist "%OFFLINE%\openpyxl-*.whl" (
-
-    echo Offline wheels found in установка\wheels
-
+    echo Offline install from wheels
     "!PYEXE!" -m pip install --no-index --find-links="%OFFLINE%" openpyxl
-
     if not errorlevel 1 goto setup_ok
-
-    echo Offline install failed, trying online...
-
 )
-
-"!PYEXE!" -m pip install --upgrade pip
-
 "!PYEXE!" -m pip install -r "%ROOT%\requirements.txt"
-
 if errorlevel 1 goto fail
-
 :setup_ok
-
-echo.
-
-echo Done. Run: run_svod.bat --check
-
+echo Done.
 pause
-
 exit /b 0
-
-
-
-:find_python
-
+:find_python_gui
 set "PYEXE="
-
-where py >nul 2>nul
-
-if not errorlevel 1 (
-
-    for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
-
+for /f "tokens=2 delims==" %%t in ('assoc .py 2^>nul') do (
+    for /f "tokens=1* delims==" %%f in ('ftype %%t 2^>nul') do (
+        set "FTYPELINE=%%f=%%g"
+    )
 )
-
+if defined FTYPELINE (
+    for /f tokens^=1^ delims^=^" %%p in ("!FTYPELINE!") do set "PYEXE=%%~p"
+)
+if defined PYEXE call :validate_python
 if defined PYEXE exit /b 0
-
+call :find_python
+exit /b %ERRORLEVEL%
+:find_python
+set "PYEXE="
 where python >nul 2>nul
-
 if not errorlevel 1 (
-
     for /f "delims=" %%i in ('python -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
-
 )
-
+call :validate_python
 if defined PYEXE exit /b 0
-
-where python3 >nul 2>nul
-
+where py >nul 2>nul
 if not errorlevel 1 (
-
-    for /f "delims=" %%i in ('python3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
-
+    for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
 )
-
+call :validate_python
 if defined PYEXE exit /b 0
-
-echo.
-
+where python3 >nul 2>nul
+if not errorlevel 1 (
+    for /f "delims=" %%i in ('python3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%i"
+)
+call :validate_python
+if defined PYEXE exit /b 0
 echo [ERROR] Python 3 not found.
-
-echo 1. Install from https://www.python.org/downloads/
-
-echo 2. Check "Add python.exe to PATH" and "tcl/tk and IDLE"
-
-echo 3. Run: run_svod.bat --setup
-
 exit /b 1
-
-
-
-:ensure_deps
-
-"!PYEXE!" -c "import openpyxl" >nul 2>nul
-
-if errorlevel 1 (
-
-    echo.
-
-    echo [ERROR] Package openpyxl is missing.
-
-    echo Run: run_svod.bat --setup
-
-    exit /b 1
-
-)
-
-if not "!GUI_MODE!"=="1" exit /b 0
-
-"!PYEXE!" -c "import tkinter; tkinter.Tk().withdraw()" >nul 2>nul
-
-if errorlevel 1 (
-
-    echo.
-
-    echo [ERROR] tkinter is not working (needed for GUI window).
-
-    echo Reinstall Python from python.org with "tcl/tk and IDLE" enabled.
-
-    echo Or use CLI: run_svod.bat --stage all
-
-    exit /b 1
-
-)
-
+:validate_python
+if not defined PYEXE exit /b 0
+echo !PYEXE! | findstr /i /c:"WindowsApps" >nul 2>nul
+if not errorlevel 1 set "PYEXE="
+if not defined PYEXE exit /b 0
+"!PYEXE!" -c "import sys" >nul 2>nul
+if errorlevel 1 set "PYEXE="
 exit /b 0
-
-
-
+:ensure_deps
+"!PYEXE!" -c "import openpyxl" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] pip install openpyxl  OR  run_svod.bat --setup
+    exit /b 1
+)
+if not "!GUI_MODE!"=="1" exit /b 0
+"!PYEXE!" -c "import tkinter; r=tkinter.Tk(); r.destroy()" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] tkinter broken - reinstall Python with tcl/tk
+    exit /b 1
+)
+exit /b 0
 :fail
-
-echo.
-
-echo Press any key to close...
-
-pause >nul
-
+pause
 exit /b 1
-
