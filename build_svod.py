@@ -2442,6 +2442,7 @@ def _write_diff_legend(ws: Worksheet) -> None:
     """Легенда в правом верхнем углу листа сравнения."""
     legend = (
         "Легенда:  "
+        "только изменённые строки;  "
         "зелёный — добавленный текст;  "
         "красный зачёркнутый — удалённый;  "
         "жёлтая заливка — изменённые даты;  "
@@ -2499,27 +2500,24 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
                                 insert_before: int, style_row: int | None,
                                 log=print) -> int:
-    """Вставляет в diff-лист строки, удалённые из сводника (есть в проекте)."""
+    """Добавляет в конец diff-листа строки, удалённые из сводника."""
     if not deleted:
         return 0
-    n = len(deleted) + 1  # +1 заголовок блока
-    ws.insert_rows(insert_before, amount=n)
-
+    cur = insert_before
     hdr_font = Font(name="Arial", size=10, bold=True, color=DIFF_COLOR_DEL)
-    hdr = ws.cell(insert_before, 1)
+    hdr = ws.cell(cur, 1)
     hdr.value = (
         f"─── Удалено из исходных проектов ({len(deleted)} стр., "
         f"не вошло в сводник) ───"
     )
     hdr.font = hdr_font
     hdr.alignment = Alignment(horizontal="center", vertical="center")
-    _apply_row_fill(ws, insert_before, DIFF_FILL_DELETED_ROW)
+    _apply_row_fill(ws, cur, DIFF_FILL_DELETED_ROW)
     try:
-        ws.merge_cells(f"A{insert_before}:{LAST_COL_LETTER}{insert_before}")
+        ws.merge_cells(f"A{cur}:{LAST_COL_LETTER}{cur}")
     except Exception:
         pass
-
-    cur = insert_before + 1
+    cur += 1
     for src in deleted:
         copy_row_full(src["src_ws"], src["src_row"], ws, cur)
         copy_merges_in_row(src["src_ws"], src["src_row"], ws, cur)
@@ -2531,38 +2529,133 @@ def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
         tag.font = Font(name="Arial", size=8, color=DIFF_COLOR_DEL, italic=True)
         cur += 1
 
-    log(f"  + {len(deleted)} удалённых строк из проектов (блок перед подписями)")
-    return n
+    log(f"  + {len(deleted)} удалённых строк из проектов")
+    return cur - insert_before
+
+
+def _copy_header_block(src_ws: Worksheet, dst_ws: Worksheet,
+                       header_last: int) -> None:
+    """Копирует шапку (строки 1..header_last) с объединениями."""
+    for r in range(1, header_last + 1):
+        copy_row_full(src_ws, r, dst_ws, r)
+    for mr in src_ws.merged_cells.ranges:
+        if mr.min_row <= header_last and mr.max_row <= header_last:
+            rng = (
+                f"{get_column_letter(mr.min_col)}{mr.min_row}:"
+                f"{get_column_letter(min(mr.max_col, TABLE_COLS))}{mr.max_row}"
+            )
+            try:
+                dst_ws.merge_cells(rng)
+            except Exception:
+                pass
+
+
+def _copy_data_row_with_merges(src_ws: Worksheet, dst_ws: Worksheet,
+                               src_row: int, dst_row: int) -> None:
+    """Копирует одну строку данных со стилями и однострочными merge."""
+    copy_row_full(src_ws, src_row, dst_ws, dst_row)
+    copy_merges_in_row(src_ws, src_row, dst_ws, dst_row)
+    if is_equipment_row(src_ws, src_row):
+        ensure_equipment_merges(dst_ws, dst_row)
+
+
+def _write_diff_filter_note(ws: Worksheet, row: int) -> None:
+    """Пояснение под шапкой: на листе только изменённые строки."""
+    text = (
+        "На этом листе показаны только изменённые строки "
+        "(без неизменённых). См. легенду справа."
+    )
+    cell = ws.cell(row, 1)
+    cell.value = text
+    cell.font = Font(name="Arial", size=9, italic=True, color="444444")
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    try:
+        ws.merge_cells(f"A{row}:{LAST_COL_LETTER}{row}")
+    except Exception:
+        pass
+    ws.row_dimensions[row].height = 16.0
+
+
+def _write_diff_empty_note(ws: Worksheet, row: int) -> None:
+    cell = ws.cell(row, 1)
+    cell.value = "Изменений относительно исходных проектов Коми/Арх РДУ не найдено."
+    cell.font = Font(name="Arial", size=10, italic=True)
+    try:
+        ws.merge_cells(f"A{row}:{LAST_COL_LETTER}{row}")
+    except Exception:
+        pass
 
 
 def build_diff_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
                      source_recs: list[dict], svod_recs: list[dict],
                      log=print) -> DiffStats:
-    """Создаёт/обновляет лист «Сравнение с проектами» — копия Page1 с разметкой."""
+    """Создаёт лист «Сравнение с проектами» — только изменённые строки."""
     if DIFF_SHEET_NAME in wb.sheetnames:
         del wb[DIFF_SHEET_NAME]
-    diff_ws = wb.copy_worksheet(svod_ws)
-    diff_ws.title = DIFF_SHEET_NAME
+    diff_ws = wb.create_sheet(DIFF_SHEET_NAME)
+    copy_column_widths(svod_ws, diff_ws)
+
+    header_last, _data_last, sig_start = find_data_bounds(svod_ws)
+    _copy_header_block(svod_ws, diff_ws, header_last)
+    dst_row = header_last + 1
+    _write_diff_filter_note(diff_ws, dst_row)
+    dst_row += 1
 
     svod_enriched = [enrich_record_texts(r) for r in svod_recs]
     pairs, stats = match_source_and_svod(source_recs, svod_enriched)
 
+    pair_by_row: dict[int, tuple[str, dict, dict | None]] = {}
     deleted: list[dict] = []
-
     for status, sv, src in pairs:
         if status == "deleted" and src:
             deleted.append(src)
-            continue
-        if sv is None:
-            continue
-        row = sv["src_row"]
-        _annotate_equipment_row_diff(diff_ws, row, sv, src, status)
+        elif sv is not None:
+            pair_by_row[sv["src_row"]] = (status, sv, src)
 
-    _header_last, data_last, sig_start = find_data_bounds(diff_ws)
-    insert_at = sig_start
-    _insert_deleted_source_rows(diff_ws, deleted, insert_at, None, log=log)
+    changed_count = stats.modified + stats.new_in_svod
+    if changed_count == 0 and not deleted:
+        _write_diff_empty_note(diff_ws, dst_row)
+        _write_diff_legend(diff_ws)
+        log(f"  изменений нет ({stats.same} строк без отличий)")
+        return stats
+
+    pending_sections: list[int] = []
+    copied_sections: set[int] = set()
+
+    for src_row in range(header_last + 1, sig_start):
+        if is_toc_row(svod_ws, src_row):
+            continue
+        if is_section_row(svod_ws, src_row):
+            pending_sections.append(src_row)
+            continue
+        if not is_equipment_row(svod_ws, src_row):
+            continue
+
+        entry = pair_by_row.get(src_row)
+        if not entry or entry[0] == "same":
+            continue
+
+        status, sv, src = entry
+        for sec_r in pending_sections:
+            if sec_r not in copied_sections:
+                _copy_data_row_with_merges(svod_ws, diff_ws, sec_r, dst_row)
+                copied_sections.add(sec_r)
+                dst_row += 1
+        pending_sections = []
+
+        _copy_data_row_with_merges(svod_ws, diff_ws, src_row, dst_row)
+        _annotate_equipment_row_diff(diff_ws, dst_row, sv, src, status)
+        dst_row += 1
+
+    if deleted:
+        _insert_deleted_source_rows(diff_ws, deleted, dst_row, None, log=log)
 
     _write_diff_legend(diff_ws)
+    log(
+        f"  на листе: {changed_count} изменённых/новых + "
+        f"{stats.deleted_from_source} удалённых "
+        f"(скрыто без изменений: {stats.same})"
+    )
     return stats
 
 
