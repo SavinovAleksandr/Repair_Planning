@@ -2,6 +2,8 @@
 """
 GUI-обёртка для сборщика сводного графика ремонтов.
 
+Copyright (c) 2026 Савинов Александр, Сыктывкар. Все права защищены.
+
 Окно даёт несколько кнопок:
   • «Сформировать сводный из проектов» — объединяет Арх + Коми (без сортировки
     и оформления) в новый файл «Сводный график …xlsx» в корне.
@@ -47,9 +49,37 @@ bs.ROOT = ROOT_DIR
 PAD = 8
 ERROR_LOG = ROOT_DIR / "gui_error.log"
 LOG_FONT = ("Consolas", 10) if sys.platform.startswith("win") else ("Menlo", 10)
+COPYRIGHT = "© Савинов Александр, Сыктывкар, 2026"
 
 
 # ------------------------------------------------------------------ ХЕЛПЕРЫ
+
+
+def bring_window_to_front(root: tk.Tk) -> None:
+    """Поднимает окно на передний план (важно при запуске через pythonw / bat)."""
+    try:
+        root.update_idletasks()
+        if root.state() == "iconic":
+            root.deiconify()
+        root.state("normal")
+        root.lift()
+        root.attributes("-topmost", True)
+        root.focus_force()
+        root.after(250, lambda: root.attributes("-topmost", False))
+    except tk.TclError:
+        pass
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        hwnd = root.winfo_id()
+        u32 = ctypes.windll.user32
+        u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        u32.AllowSetForegroundWindow(-1)
+        u32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
 
 
 def open_in_system(path: Path) -> None:
@@ -96,6 +126,9 @@ class SvodApp(tk.Tk):
 
         self._build_ui()
         self._refresh_status()
+        bring_window_to_front(self)
+        self.after(150, lambda: bring_window_to_front(self))
+        self.after(600, lambda: bring_window_to_front(self))
         # Периодический опрос очереди сообщений.
         self.after(120, self._pump_messages)
 
@@ -206,6 +239,13 @@ class SvodApp(tk.Tk):
             logf, wrap="word", height=14, font=LOG_FONT)
         self.log.pack(fill=tk.BOTH, expand=True)
         self.log.configure(state="disabled")
+
+        ttk.Label(
+            self,
+            text=COPYRIGHT,
+            foreground="#888",
+            font=("", 9),
+        ).pack(side=tk.BOTTOM, anchor="e", padx=PAD, pady=(0, 4))
 
         # Кнопку-акцент обустроим покрасивее, где тема поддерживает.
         try:

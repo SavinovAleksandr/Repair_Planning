@@ -2,6 +2,8 @@
 """
 Сборщик сводного графика ремонтов ЛЭП и сетевого оборудования.
 
+Copyright (c) 2026 Савинов Александр, Сыктывкар. Все права защищены.
+
 Принцип работы
 --------------
 Скрипт ищет в своей папке файлы:
@@ -46,6 +48,8 @@ from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.worksheet import Worksheet
 
 # ------------------------------------------------------------------ КОНСТАНТЫ -
+
+__copyright__ = "© Савинов Александр, Сыктывкар, 2026"
 
 ROOT = Path(__file__).resolve().parent
 
@@ -2763,7 +2767,8 @@ def _require_existing_svod(log=print) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Сборщик сводного графика ремонтов ЛЭП и сетевого оборудования."
+        description="Сборщик сводного графика ремонтов ЛЭП и сетевого оборудования.",
+        epilog=__copyright__,
     )
     parser.add_argument("--stage", choices=STAGE_CHOICES, default="all",
                         help="Какую стадию выполнить. По умолчанию «all» — "
