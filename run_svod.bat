@@ -5,16 +5,33 @@ cd /d "%~dp0"
 set "ROOT=%~dp0"
 set "ROOT=%ROOT:~0,-1%"
 set "LOG=%ROOT%\launch_debug.log"
+set "DEBUG=0"
+if /i "%~1"=="--debug" set "DEBUG=1"
 if /i "%~1"=="--check" goto check
+if /i "%~2"=="--check" goto check
 if /i "%~1"=="--setup" goto setup
+if /i "%~2"=="--setup" goto setup
+if "%~1"=="" goto run_gui
+if /i "%~1"=="--debug" if "%~2"=="" goto run_gui
+if /i "%~1"=="--debug" (
+    shift
+    goto run_cli
+)
 if not "%~1"=="" goto run_cli
+goto run_gui
+:run_gui
 call :find_python_gui
 if errorlevel 1 goto fail
-echo [%date% %time%] GUI "!PYEXE!" >> "%LOG%"
-"!PYEXE!" "%ROOT%\gui_svod.py"
-set "RC=!ERRORLEVEL!"
-echo [%date% %time%] GUI exit !RC! >> "%LOG%"
-if not "!RC!"=="0" goto gui_failed
+call :resolve_pythonw
+echo [%date% %time%] GUI PYW="!PYW!" >> "%LOG%"
+if "!DEBUG!"=="1" (
+    "!PYEXE!" "%ROOT%\gui_svod.py"
+    set "RC=!ERRORLEVEL!"
+    echo [%date% %time%] GUI exit !RC! >> "%LOG%"
+    if not "!RC!"=="0" goto gui_failed
+    exit /b 0
+)
+start "" "!PYW!" "%ROOT%\gui_svod.py"
 exit /b 0
 :gui_failed
 echo.
@@ -25,7 +42,6 @@ if exist "%ROOT%\gui_error.log" (
 )
 echo.
 echo Log: %LOG%
-echo Tip: double-click gui_svod.py or "Zapusk GUI.bat"
 goto fail
 :run_cli
 set "SCRIPT=%ROOT%\build_svod.py"
@@ -55,6 +71,8 @@ call :find_python_gui
 if errorlevel 1 call :find_python
 if errorlevel 1 goto fail
 echo Python: "!PYEXE!"
+call :resolve_pythonw
+echo GUI launcher: "!PYW!"
 "!PYEXE!" --version
 set "GUI_MODE=1"
 call :ensure_deps
@@ -79,6 +97,15 @@ if errorlevel 1 goto fail
 :setup_ok
 echo Done.
 pause
+exit /b 0
+:resolve_pythonw
+set "PYW="
+for %%F in ("!PYEXE!") do set "PYW=%%~dpFpythonw.exe"
+if exist "!PYW!" exit /b 0
+set "PYW=!PYEXE:python.exe=pythonw.exe!"
+if exist "!PYW!" exit /b 0
+echo [WARN] pythonw.exe not found, using python.exe >> "%LOG%"
+set "PYW=!PYEXE!"
 exit /b 0
 :find_python_gui
 set "PYEXE="

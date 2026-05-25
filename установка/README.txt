@@ -17,7 +17,9 @@ tkinter идёт вместе с Python — отдельно не ставитс
   1. Дважды кликнуть install_offline.bat
   2. Перейти в корень программы (папка с run_svod.bat)
   3. run_svod.bat --check
-  4. run_svod.bat  — открыть окно программы
+  4. run_svod.bat  — открыть окно программы (без чёрной консоли)
+
+Если окно не открылось: run_svod.bat --debug
 
 Альтернатива из корня программы:
   run_svod.bat --setup
