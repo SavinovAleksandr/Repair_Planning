@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
 import sys
@@ -38,6 +39,8 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.worksheet import Worksheet
@@ -134,6 +137,13 @@ GANTT_COLORS: dict[str, str] = {
 GANTT_COLOR_OTHER = "EEEEEE"
 GANTT_COLOR_WEEKEND = "F2F2F2"
 GANTT_SHEET_NAME = "Диаграмма"
+
+DIFF_SHEET_NAME = "Сравнение с проектами"
+DIFF_FILL_DELETED_ROW = "FFC7CE"   # светло-красная заливка удалённых строк
+DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые строки в своднике
+DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
+DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
+DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
 
 BACKUP_DIR = ROOT / "backups"
 SVOD_FILE_PREFIX = "Сводный график ремонтов"
@@ -2158,6 +2168,437 @@ def stage_rebuild_from_existing(svod_path: Path, year_hint: int | None,
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Лист «Сравнение с проектами» — diff сводника vs исходные Коми/Арх
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DiffStats:
+    """Сводка построения листа сравнения."""
+    same: int = 0
+    modified: int = 0
+    new_in_svod: int = 0
+    deleted_from_source: int = 0
+
+
+def _norm_match_key(text: str) -> str:
+    """Ключ сопоставления строк оборудования (без учёта регистра/пробелов)."""
+    s = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    s = s.replace("–", "-").replace("—", "-")
+    return s
+
+
+def record_match_key(rec: dict) -> tuple[str, str]:
+    return (str(rec.get("rdu") or ""), _norm_match_key(rec.get("name", "")))
+
+
+def enrich_record_texts(rec: dict) -> dict:
+    """Добавляет в запись текстовые поля A/H/N и даты для сравнения."""
+    out = dict(rec)
+    ws = rec["src_ws"]
+    row = rec["src_row"]
+    layout = rec.get("layout")
+    if not isinstance(layout, ProjectLayout):
+        layout = detect_project_layout(ws)
+    out["layout"] = layout
+    out["h_text"] = _cell_text_with_merges(ws, row, 8).strip()
+    out["n_text"] = _cell_text_with_merges(ws, row, layout.col_repair).strip()
+    out["start_text"] = _cell_text_with_merges(ws, row, layout.col_start).strip()
+    out["end_text"] = _cell_text_with_merges(ws, row, layout.col_end).strip()
+    return out
+
+
+def load_source_records(root: Path, year_hint: int | None = None,
+                        log=print) -> list[dict]:
+    """Читает все строки оборудования из проектов Коми и Арх РДУ."""
+    p_arkh = find_file(FILE_ARKH)
+    p_komi = find_file(FILE_KOMI)
+    if not p_arkh and not p_komi:
+        raise RuntimeError(
+            f"Для сравнения нужны «{FILE_ARKH}» и/или «{FILE_KOMI}» в папке {root}."
+        )
+    default_year = year_hint or datetime.now().year
+    records: list[dict] = []
+    if p_arkh:
+        log(f"  исходник: {p_arkh.name}")
+        wb = openpyxl.load_workbook(p_arkh)
+        ws = find_project_sheet(wb)
+        layout = validate_project_template(ws, p_arkh.name)
+        records += extract_records(ws, "Арх", default_year, "arkh", layout)
+    if p_komi:
+        log(f"  исходник: {p_komi.name}")
+        wb = openpyxl.load_workbook(p_komi)
+        ws = find_project_sheet(wb)
+        layout = validate_project_template(ws, p_komi.name)
+        records += extract_records(ws, "Коми", default_year, "komi", layout)
+    return [enrich_record_texts(r) for r in records]
+
+
+def _dates_equal(a: tuple | None, b: tuple | None) -> bool:
+    return a == b
+
+
+def _record_fields_differ(svod: dict, source: dict) -> bool:
+    if not _dates_equal(svod.get("start"), source.get("start")):
+        return True
+    if not _dates_equal(svod.get("end"), source.get("end")):
+        return True
+    if _norm_match_key(svod.get("h_text", "")) != _norm_match_key(source.get("h_text", "")):
+        return True
+    if _norm_match_key(svod.get("n_text", "")) != _norm_match_key(source.get("n_text", "")):
+        return True
+    if _norm_match_key(svod.get("name", "")) != _norm_match_key(source.get("name", "")):
+        return True
+    return False
+
+
+def match_source_and_svod(source_recs: list[dict],
+                          svod_recs: list[dict]
+                          ) -> tuple[list[tuple[str, dict | None, dict | None]],
+                                     DiffStats]:
+    """Сопоставляет записи сводника с исходными проектами.
+
+    Сначала по паре (РДУ, наименование), затем — только по наименованию
+    среди оставшихся (на случай неточного определения РДУ в своднике).
+
+    Возвращает список (status, svod_rec|None, source_rec|None) и статистику.
+    status: same | modified | new | deleted
+    """
+    from collections import defaultdict
+
+    pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    name_pool: dict[str, list[dict]] = defaultdict(list)
+    for s in source_recs:
+        pool[record_match_key(s)].append(s)
+        name_pool[_norm_match_key(s.get("name", ""))].append(s)
+
+    pairs: list[tuple[str, dict | None, dict | None]] = []
+    stats = DiffStats()
+
+    def _consume_source(src: dict) -> None:
+        rk = record_match_key(src)
+        nk = _norm_match_key(src.get("name", ""))
+        for key, pd in ((rk, pool), (nk, name_pool)):
+            lst = pd.get(key)
+            if lst and src in lst:
+                lst.remove(src)
+                if not lst:
+                    pd.pop(key, None)
+
+    unmatched_sources: list[dict] = []
+    for s in source_recs:
+        unmatched_sources.append(s)
+
+    for sv in svod_recs:
+        src = None
+        rk = record_match_key(sv)
+        nk = _norm_match_key(sv.get("name", ""))
+        lst = pool.get(rk)
+        if lst:
+            src = lst.pop(0)
+            if not lst:
+                pool.pop(rk, None)
+        if src is None:
+            lst = name_pool.get(nk)
+            if lst:
+                src = lst.pop(0)
+                if not lst:
+                    name_pool.pop(nk, None)
+        if src is not None:
+            _consume_source(src)
+            if src in unmatched_sources:
+                unmatched_sources.remove(src)
+        if src is None:
+            pairs.append(("new", sv, None))
+            stats.new_in_svod += 1
+        elif _record_fields_differ(sv, src):
+            pairs.append(("modified", sv, src))
+            stats.modified += 1
+        else:
+            pairs.append(("same", sv, src))
+            stats.same += 1
+
+    for src in unmatched_sources:
+        pairs.append(("deleted", None, src))
+        stats.deleted_from_source += 1
+
+    return pairs, stats
+
+
+def _inline_font(base: Font | None, *, color: str | None = None,
+                 strike: bool = False, bold: bool = False) -> InlineFont:
+    """InlineFont для rich text с наследованием размера/имени из ячейки."""
+    name = (base.name if base and base.name else "Arial")
+    size = base.size if base and base.size else 10.0
+    kw: dict = {"rFont": name, "sz": size}
+    if color:
+        kw["color"] = color
+    if strike:
+        kw["strike"] = True
+    if bold:
+        kw["b"] = True
+    return InlineFont(**kw)
+
+
+def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText | str:
+    """Rich text: зелёные вставки, красный зачёркнутый удалённый фрагмент."""
+    old = old or ""
+    new = new or ""
+    if old == new:
+        return new
+    sm = difflib.SequenceMatcher(None, old, new)
+    blocks: list[TextBlock] = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            chunk = new[j1:j2]
+            if chunk:
+                blocks.append(TextBlock(_inline_font(base_font), chunk))
+        elif op == "delete":
+            chunk = old[i1:i2]
+            if chunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                    chunk,
+                ))
+        elif op == "insert":
+            chunk = new[j1:j2]
+            if chunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_ADD),
+                    chunk,
+                ))
+        elif op == "replace":
+            ochunk = old[i1:i2]
+            nchunk = new[j1:j2]
+            if ochunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                    ochunk,
+                ))
+            if nchunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_ADD),
+                    nchunk,
+                ))
+    if not blocks:
+        return new
+    return CellRichText(blocks)
+
+
+def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
+                        new_d: tuple | None, base_font: Font | None
+                        ) -> CellRichText | str:
+    """Ячейка даты: новое значение + подсветка; при изменении — было → стало."""
+    new_show = new_t or (format_date_tuple(new_d) if new_d else "")
+    old_show = old_t or (format_date_tuple(old_d) if old_d else "")
+    if _norm_match_key(old_show) == _norm_match_key(new_show):
+        return new_show
+    if not old_show:
+        return _text_diff_rich("", new_show, base_font)
+    if not new_show:
+        return CellRichText([
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                      old_show),
+        ])
+    combined_old = f"{old_show} → "
+    combined_new = f"{old_show} → {new_show}"
+    return _text_diff_rich(combined_old, combined_new, base_font)
+
+
+def format_date_tuple(d: tuple[int, int, int] | None) -> str:
+    if not d:
+        return ""
+    _y, m, day = d
+    return f"{day:02d}.{m:02d}."
+
+
+def _apply_row_fill(ws: Worksheet, row: int, color: str,
+                    ncols: int = TABLE_COLS) -> None:
+    fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+    for c in range(1, ncols + 1):
+        ws.cell(row, c).fill = fill
+
+
+def _apply_strikethrough_row(ws: Worksheet, row: int,
+                             ncols: int = TABLE_COLS) -> None:
+    """Красный зачёркнутый текст во всех непустых ячейках строки."""
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row, c)
+        v = cell.value
+        if v is None or str(v).strip() == "":
+            continue
+        base = cell.font
+        cell.font = Font(
+            name=base.name if base else "Arial",
+            size=base.size if base else 10,
+            bold=base.bold if base else False,
+            italic=base.italic if base else False,
+            strike=True,
+            color=DIFF_COLOR_DEL,
+        )
+
+
+def _write_diff_legend(ws: Worksheet) -> None:
+    """Легенда в правом верхнем углу листа сравнения."""
+    legend = (
+        "Легенда:  "
+        "зелёный — добавленный текст;  "
+        "красный зачёркнутый — удалённый;  "
+        "жёлтая заливка — изменённые даты;  "
+        "зелёная строка — новая в своднике;  "
+        "красная строка — удалена из проекта"
+    )
+    cell = ws.cell(1, TABLE_COLS + 1)
+    cell.value = legend
+    cell.font = Font(name="Arial", size=9, italic=True)
+    cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions[get_column_letter(TABLE_COLS + 1)].width = 48
+
+
+def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
+                                 source: dict | None, status: str) -> None:
+    """Размечает одну строку оборудования на листе сравнения."""
+    layout = svod.get("layout") or detect_project_layout(ws)
+
+    if status == "new":
+        _apply_row_fill(ws, row, DIFF_FILL_NEW_ROW)
+        return
+
+    if status == "same" or source is None:
+        return
+
+    # Текстовые колонки A, H, N — посимвольный diff.
+    for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
+        cell = ws.cell(row, col)
+        old_t = source.get(fld, "")
+        new_t = svod.get(fld, "")
+        if _norm_match_key(old_t) != _norm_match_key(new_t):
+            rich = _text_diff_rich(old_t, new_t, cell.font)
+            cell.value = rich
+
+    # Даты F/G.
+    for col, fld_t, fld_d in (
+        (layout.col_start, "start_text", "start"),
+        (layout.col_end, "end_text", "end"),
+    ):
+        cell = ws.cell(row, col)
+        old_t = source.get(fld_t, "")
+        new_t = svod.get(fld_t, "")
+        if (not _dates_equal(svod.get(fld_d), source.get(fld_d))
+                or _norm_match_key(old_t) != _norm_match_key(new_t)):
+            cell.value = _format_date_change(
+                old_t, new_t, source.get(fld_d), svod.get(fld_d), cell.font,
+            )
+            cell.fill = PatternFill(
+                start_color=DIFF_FILL_DATE_CHG,
+                end_color=DIFF_FILL_DATE_CHG,
+                fill_type="solid",
+            )
+
+
+def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
+                                insert_before: int, style_row: int | None,
+                                log=print) -> int:
+    """Вставляет в diff-лист строки, удалённые из сводника (есть в проекте)."""
+    if not deleted:
+        return 0
+    n = len(deleted) + 1  # +1 заголовок блока
+    ws.insert_rows(insert_before, amount=n)
+
+    hdr_font = Font(name="Arial", size=10, bold=True, color=DIFF_COLOR_DEL)
+    hdr = ws.cell(insert_before, 1)
+    hdr.value = (
+        f"─── Удалено из исходных проектов ({len(deleted)} стр., "
+        f"не вошло в сводник) ───"
+    )
+    hdr.font = hdr_font
+    hdr.alignment = Alignment(horizontal="center", vertical="center")
+    _apply_row_fill(ws, insert_before, DIFF_FILL_DELETED_ROW)
+    try:
+        ws.merge_cells(f"A{insert_before}:{LAST_COL_LETTER}{insert_before}")
+    except Exception:
+        pass
+
+    cur = insert_before + 1
+    for src in deleted:
+        copy_row_full(src["src_ws"], src["src_row"], ws, cur)
+        copy_merges_in_row(src["src_ws"], src["src_row"], ws, cur)
+        ensure_equipment_merges(ws, cur)
+        _apply_row_fill(ws, cur, DIFF_FILL_DELETED_ROW)
+        _apply_strikethrough_row(ws, cur)
+        tag = ws.cell(cur, TABLE_COLS + 1)
+        tag.value = f"[удалено · {src.get('rdu', '?')} РДУ]"
+        tag.font = Font(name="Arial", size=8, color=DIFF_COLOR_DEL, italic=True)
+        cur += 1
+
+    log(f"  + {len(deleted)} удалённых строк из проектов (блок перед подписями)")
+    return n
+
+
+def build_diff_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
+                     source_recs: list[dict], svod_recs: list[dict],
+                     log=print) -> DiffStats:
+    """Создаёт/обновляет лист «Сравнение с проектами» — копия Page1 с разметкой."""
+    if DIFF_SHEET_NAME in wb.sheetnames:
+        del wb[DIFF_SHEET_NAME]
+    diff_ws = wb.copy_worksheet(svod_ws)
+    diff_ws.title = DIFF_SHEET_NAME
+
+    svod_enriched = [enrich_record_texts(r) for r in svod_recs]
+    pairs, stats = match_source_and_svod(source_recs, svod_enriched)
+
+    deleted: list[dict] = []
+
+    for status, sv, src in pairs:
+        if status == "deleted" and src:
+            deleted.append(src)
+            continue
+        if sv is None:
+            continue
+        row = sv["src_row"]
+        _annotate_equipment_row_diff(diff_ws, row, sv, src, status)
+
+    _header_last, data_last, sig_start = find_data_bounds(diff_ws)
+    insert_at = sig_start
+    _insert_deleted_source_rows(diff_ws, deleted, insert_at, None, log=log)
+
+    _write_diff_legend(diff_ws)
+    return stats
+
+
+def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
+                             year_hint: int | None = None,
+                             log=print) -> DiffStats:
+    """Добавляет в сводник лист «Сравнение с проектами».
+
+    Лист — копия Page1 с подсветкой отличий от файлов «Проект Коми/Арх РДУ»:
+      • зелёный текст — добавленные символы (авто- или ручная правка);
+      • красный зачёркнутый — удалённый фрагмент / строка;
+      • жёлтая заливка — изменённые даты начала/окончания.
+    """
+    root = root or ROOT
+    log(f"Сравнение с проектами: {svod_path.name}")
+    log("Читаю исходные проекты…")
+    parse_year = default_year_for_svod(svod_path, year_hint)
+    source_recs = load_source_records(root, parse_year, log=log)
+
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1».")
+    ws = wb["Page1"]
+    svod_recs = extract_records_from_svod(ws, default_year=parse_year)
+
+    stats = build_diff_sheet(wb, ws, source_recs, svod_recs, log=log)
+    log(
+        f"  без изменений: {stats.same}; изменено: {stats.modified}; "
+        f"новых в своднике: {stats.new_in_svod}; "
+        f"удалено из проектов: {stats.deleted_from_source}"
+    )
+    log(f"  лист «{DIFF_SHEET_NAME}» создан.")
+    _save_with_backup(wb, svod_path, log=log)
+    return stats
+
+
 # ---------------------------------------------------------------- ТОЧКА ВХОДА
 
 def _short(s: str, limit: int = 100) -> str:
@@ -2204,6 +2645,7 @@ STAGE_CHOICES = (
     "toc",         # только перегенерация оглавления
     "heights",     # только фиксация высот и wrap_text
     "gantt",       # только перестроить лист «Диаграмма»
+    "diff",        # лист «Сравнение с проектами» vs исходные Коми/Арх
     "restore",     # откатить сводник к последней резервной копии
 )
 
@@ -2300,6 +2742,10 @@ def main():
         elif args.stage == "gantt":
             svod = _require_existing_svod()
             stage_build_gantt_inplace(svod, args.year, log=print)
+
+        elif args.stage == "diff":
+            svod = _require_existing_svod()
+            stage_build_diff_inplace(svod, ROOT, args.year, log=print)
 
         elif args.stage == "restore":
             svod = find_existing_svod(ROOT)

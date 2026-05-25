@@ -84,6 +84,7 @@ class SvodApp(tk.Tk):
         self.var_toc = tk.BooleanVar(value=True)
         self.var_heights = tk.BooleanVar(value=True)
         self.var_gantt = tk.BooleanVar(value=True)
+        self.var_diff = tk.BooleanVar(value=False)
         # Нормализация в «Всё и сразу».
         self.var_all_norm = tk.BooleanVar(value=True)
 
@@ -158,9 +159,18 @@ class SvodApp(tk.Tk):
             row=2, column=0, sticky="w", padx=(0, 16), pady=2)
 
         btn_gantt = ttk.Button(
-            g2, text="Обновить диаграмму Ганта (после правки дат)",
+            grid, text="Обновить диаграмму Ганта",
             command=self._on_refresh_gantt)
-        btn_gantt.grid(row=2, column=1, sticky="e", pady=2)
+        btn_gantt.grid(row=2, column=1, sticky="w", pady=2)
+
+        ttk.Checkbutton(grid, text="Сравнение с проектами (новая вкладка)",
+                        variable=self.var_diff).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=2)
+
+        btn_diff = ttk.Button(
+            grid, text="Построить сравнение с Коми/Арх",
+            command=self._on_build_diff)
+        btn_diff.grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
 
         btn_apply = ttk.Button(
             g2, text="Выполнить отмеченное",
@@ -355,7 +365,8 @@ class SvodApp(tk.Tk):
         do_toc = self.var_toc.get()
         do_heights = self.var_heights.get()
         do_gantt = self.var_gantt.get()
-        if not any([do_sort, do_norm, do_toc, do_heights, do_gantt]):
+        do_diff = self.var_diff.get()
+        if not any([do_sort, do_norm, do_toc, do_heights, do_gantt, do_diff]):
             messagebox.showinfo("Ничего не выбрано",
                                 "Отметьте хотя бы одну стадию.")
             return
@@ -389,6 +400,10 @@ class SvodApp(tk.Tk):
                 self._push("log", "→ Диаграмма Ганта (актуальные даты с Page1)")
                 bs.stage_build_gantt_inplace(
                     svod, None, log=self._log_fn)
+            if do_diff and not do_sort:
+                self._push("log", "→ Сравнение с проектами (новая вкладка)")
+                bs.stage_build_diff_inplace(
+                    svod, ROOT_DIR, None, log=self._log_fn)
             self._report_norm(stats)
 
         self._run_in_thread(run)
@@ -409,6 +424,38 @@ class SvodApp(tk.Tk):
                        "Читаю даты начала/окончания (F/G) с листа Page1…")
             bs.stage_build_gantt_inplace(svod, None, log=self._log_fn)
             self._push("log", "Готово. Откройте лист «Диаграмма» в своднике.")
+
+        self._run_in_thread(run)
+
+    def _on_build_diff(self) -> None:
+        """Лист «Сравнение с проектами» — diff сводника vs Коми/Арх."""
+        svod = bs.find_existing_svod(ROOT_DIR)
+        if svod is None:
+            messagebox.showerror(
+                "Нет сводника",
+                f"В папке {ROOT_DIR} не найден «Сводный график …xlsx».",
+            )
+            return
+        p_komi = bs.find_file(bs.FILE_KOMI)
+        p_arkh = bs.find_file(bs.FILE_ARKH)
+        if not p_komi and not p_arkh:
+            messagebox.showerror(
+                "Нет исходников",
+                "Для сравнения положите в папку файлы\n"
+                f"«{bs.FILE_KOMI}» и/или «{bs.FILE_ARKH}».",
+            )
+            return
+
+        def run():
+            self._push("log", "=== Сравнение с исходными проектами ===")
+            stats = bs.stage_build_diff_inplace(
+                svod, ROOT_DIR, None, log=self._log_fn)
+            self._push(
+                "log",
+                f"Итого: изменено {stats.modified}, новых {stats.new_in_svod}, "
+                f"удалено из проектов {stats.deleted_from_source}. "
+                f"Откройте вкладку «{bs.DIFF_SHEET_NAME}».",
+            )
 
         self._run_in_thread(run)
 
