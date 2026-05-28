@@ -2495,40 +2495,14 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
     return CellRichText(blocks)
 
 
-def _text_diff_for_field(old_t: str, new_t: str,
-                         base_font: Font | None) -> CellRichText | str:
-    """Diff для A/H/N: посимвольный при правках, две строки (−/+) при замене."""
-    old_t = old_t or ""
-    new_t = new_t or ""
-    if not old_t or not new_t:
-        return _text_diff_rich(old_t, new_t, base_font)
-    if old_t in new_t or new_t in old_t:
-        return _text_diff_rich(old_t, new_t, base_font)
-    if difflib.SequenceMatcher(None, old_t, new_t).ratio() >= 0.55:
-        return _text_diff_rich(old_t, new_t, base_font)
-    blocks: list[TextBlock] = []
-    if old_t.strip():
-        blocks.append(TextBlock(
-            _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-            f"− {old_t}",
-        ))
-    if new_t.strip():
-        if blocks:
-            blocks.append(TextBlock(_inline_font(base_font), "\n"))
-        blocks.append(TextBlock(
-            _inline_font(base_font, color=DIFF_COLOR_ADD),
-            f"+ {new_t}",
-        ))
-    return CellRichText(blocks) if blocks else new_t
-
-
-def _format_scalar_change(old_show: str, new_show: str,
-                          base_font: Font | None) -> CellRichText | str:
-    """Rich text «было → стало» для E/F/G (ячейки без merge)."""
-    old_show = str(old_show or "").strip()
-    new_show = str(new_show or "").strip()
+def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
+                        new_d: tuple | None, base_font: Font | None
+                        ) -> CellRichText | str:
+    """Ячейка даты/числа: rich text «было → стало» (E/F/G не merged)."""
+    new_show = new_t or (format_date_tuple(new_d) if new_d else "")
+    old_show = old_t or (format_date_tuple(old_d) if old_d else "")
     if _norm_match_key(old_show) == _norm_match_key(new_show):
-        return new_show or old_show
+        return new_show
     if not old_show:
         return _text_diff_rich("", new_show, base_font)
     if not new_show:
@@ -2541,13 +2515,19 @@ def _format_scalar_change(old_show: str, new_show: str,
     return _text_diff_rich(combined_old, combined_new, base_font)
 
 
-def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
-                        new_d: tuple | None, base_font: Font | None
-                        ) -> CellRichText | str:
-    """Ячейка даты: rich text с зелёными/красными фрагментами (F/G не merged)."""
-    new_show = new_t or (format_date_tuple(new_d) if new_d else "")
-    old_show = old_t or (format_date_tuple(old_d) if old_d else "")
-    return _format_scalar_change(old_show, new_show, base_font)
+def _apply_date_cell_diff(cell, old_show: str, new_show: str) -> None:
+    """Подсветка изменения в E/F/G: rich text и жёлтая заливка."""
+    old_show = str(old_show or "").strip()
+    new_show = str(new_show or "").strip()
+    if _norm_match_key(old_show) == _norm_match_key(new_show):
+        return
+    cell.value = _format_date_change(
+        old_show, new_show, None, None, cell.font)
+    cell.fill = PatternFill(
+        start_color=DIFF_FILL_DATE_CHG,
+        end_color=DIFF_FILL_DATE_CHG,
+        fill_type="solid",
+    )
 
 
 def _strip_copy_boilerplate(text: str) -> str:
@@ -2607,43 +2587,6 @@ def _copy_sheet_page_setup(src_ws: Worksheet, dst_ws: Worksheet) -> None:
         pass
 
 
-def _mark_changed_cell(cell, *, wrap: bool = False) -> None:
-    """Жёлтая заливка и перенос текста для изменённой ячейки diff-листа."""
-    cell.fill = PatternFill(
-        start_color=DIFF_FILL_DATE_CHG,
-        end_color=DIFF_FILL_DATE_CHG,
-        fill_type="solid",
-    )
-    if wrap:
-        al = cell.alignment
-        cell.alignment = Alignment(
-            horizontal=al.horizontal if al and al.horizontal else "left",
-            vertical="center",
-            wrap_text=True,
-            text_rotation=al.text_rotation if al else 0,
-        )
-
-
-def _apply_text_field_diff(cell, old_t: str, new_t: str) -> None:
-    """Посимвольный diff в A/H/N (merge): зелёные вставки, красный зачёркнутый."""
-    old_t = str(old_t or "")
-    new_t = str(new_t or "")
-    if _norm_match_key(old_t) == _norm_match_key(new_t):
-        return
-    cell.value = _text_diff_for_field(old_t, new_t, cell.font)
-    _mark_changed_cell(cell, wrap=True)
-
-
-def _apply_scalar_field_diff(cell, old_show: str, new_show: str) -> None:
-    """Diff для E/F/G: rich text «было → стало»."""
-    old_show = str(old_show or "").strip()
-    new_show = str(new_show or "").strip()
-    if _norm_match_key(old_show) == _norm_match_key(new_show):
-        return
-    cell.value = _format_scalar_change(old_show, new_show, cell.font)
-    _mark_changed_cell(cell)
-
-
 def _write_diff_legend(ws: Worksheet) -> None:
     """Легенда в правом верхнем углу листа сравнения."""
     legend = (
@@ -2651,7 +2594,7 @@ def _write_diff_legend(ws: Worksheet) -> None:
         "только изменённые строки;  "
         "зелёный — добавленный текст;  "
         "красный зачёркнутый — удалённый;  "
-        "жёлтая заливка — изменённые E/F/G и текст A/H/N;  "
+        "жёлтая заливка — изменённые даты;  "
         "зелёная строка — новая в своднике;  "
         "красная строка — удалена из проекта"
     )
@@ -2674,13 +2617,16 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # A, H, N — посимвольный diff в merge (структура как Page1).
+    # A, H, N — посимвольный diff (как в 839677f): без заливки ячейки.
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
-        _apply_text_field_diff(
-            ws.cell(row, col), source.get(fld, ""), svod.get(fld, ""))
+        cell = ws.cell(row, col)
+        old_t = source.get(fld, "")
+        new_t = svod.get(fld, "")
+        if _norm_match_key(old_t) != _norm_match_key(new_t):
+            cell.value = _text_diff_rich(old_t, new_t, cell.font)
 
-    # E — кол-во дней.
-    _apply_scalar_field_diff(
+    # E — кол-во дней (жёлтая заливка, как F/G).
+    _apply_date_cell_diff(
         ws.cell(row, layout.col_days),
         source.get("days_text", ""),
         svod.get("days_text", ""),
@@ -2694,11 +2640,11 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
         cell = ws.cell(row, col)
         old_t = source.get(fld_t, "")
         new_t = svod.get(fld_t, "")
-        old_show = old_t or format_date_tuple(source.get(fld_d))
-        new_show = new_t or format_date_tuple(svod.get(fld_d))
         if (not _dates_equal(svod.get(fld_d), source.get(fld_d))
-                or _norm_match_key(old_show) != _norm_match_key(new_show)):
-            _apply_scalar_field_diff(cell, old_show, new_show)
+                or _norm_match_key(old_t) != _norm_match_key(new_t)):
+            old_show = old_t or format_date_tuple(source.get(fld_d))
+            new_show = new_t or format_date_tuple(svod.get(fld_d))
+            _apply_date_cell_diff(cell, old_show, new_show)
 
 
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
