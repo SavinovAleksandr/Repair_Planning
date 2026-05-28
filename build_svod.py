@@ -147,9 +147,6 @@ DIFF_CLEAN_SHEET_NAME = "вставить в ПК Ремонты"
 DIFF_FILL_DELETED_ROW = "FFC7CE"   # светло-красная заливка удалённых строк
 DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые строки в своднике
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
-DIFF_FILL_TEXT = PatternFill(
-    fill_type="solid", start_color="FFFFFFFF", end_color="FFFFFFFF",
-)
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
 
@@ -2519,14 +2516,46 @@ def _prepare_cell_font_for_rich(cell) -> Font:
     )
 
 
-def _apply_rich_text_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Посимвольный rich text в top-left merge; без unmerge (Excel-safe)."""
-    if _norm_match_key(old_t or "") == _norm_match_key(new_t or ""):
+def _apply_plain_merged_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
+    """Diff в объединённых A/H/N — только plain text (rich text ломает sheet3.xml).
+
+    Удаление — красный зачёркнутый текст ячейки; добавление/расширение — зелёный;
+    замена — две строки «− … / + …» с жёлтой заливкой.
+    """
+    old_t = str(old_t or "")
+    new_t = str(new_t or "")
+    if _norm_match_key(old_t) == _norm_match_key(new_t):
         return
-    base_font = cell.font
-    cell.value = _text_diff_rich(old_t, new_t, base_font)
-    cell.font = _prepare_cell_font_for_rich(cell)
-    cell.fill = DIFF_FILL_TEXT
+    base = cell.font
+    fname = base.name if base and base.name else "Arial"
+    fsize = base.size if base and base.size else 10.0
+
+    if not old_t.strip():
+        cell.value = new_t
+        cell.font = Font(name=fname, size=fsize, color=DIFF_COLOR_ADD)
+    elif not new_t.strip():
+        cell.value = old_t
+        cell.font = Font(
+            name=fname, size=fsize, color=DIFF_COLOR_DEL, strike=True,
+        )
+    elif (new_t.rstrip().startswith(old_t.rstrip())
+          and len(new_t.strip()) > len(old_t.strip())):
+        cell.value = new_t
+        cell.font = Font(name=fname, size=fsize, color=DIFF_COLOR_ADD)
+    elif old_t.startswith(new_t.rstrip()):
+        cell.value = old_t
+        cell.font = Font(
+            name=fname, size=fsize, color=DIFF_COLOR_DEL, strike=True,
+        )
+    else:
+        cell.value = f"− {old_t}\n+ {new_t}"
+        cell.font = Font(name=fname, size=fsize)
+        cell.fill = PatternFill(
+            start_color=DIFF_FILL_DATE_CHG,
+            end_color=DIFF_FILL_DATE_CHG,
+            fill_type="solid",
+        )
+
     if wrap:
         al = cell.alignment
         cell.alignment = Alignment(
@@ -2640,9 +2669,10 @@ def _write_diff_legend(ws: Worksheet) -> None:
     legend = (
         "Легенда:  "
         "только изменённые строки;  "
-        "зелёный — добавленный текст;  "
-        "красный зачёркнутый — удалённый;  "
-        "жёлтая заливка — изменённые даты;  "
+        "зелёный — добавленный текст (H/N/A);  "
+        "красный зачёркнутый — удалённый (H/N/A);  "
+        "жёлтая заливка — замена текста или изменённые даты E/F/G;  "
+        "даты E/F/G — «было → стало», новая часть зелёная;  "
         "зелёная строка — новая в своднике;  "
         "красная строка — удалена из проекта"
     )
@@ -2665,9 +2695,9 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # A, H, N — посимвольный diff (как в 839677f): без заливки ячейки.
+    # A, H, N — plain diff в merge (без rich text: Excel sheet3.xml).
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
-        _apply_rich_text_diff(
+        _apply_plain_merged_diff(
             ws.cell(row, col),
             source.get(fld, ""),
             svod.get(fld, ""),

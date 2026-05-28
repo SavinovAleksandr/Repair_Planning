@@ -108,11 +108,11 @@ class SvodApp(tk.Tk):
 
         # Переменные чекбоксов стадий.
         self.var_merge = tk.BooleanVar(value=False)
-        self.var_sort = tk.BooleanVar(value=True)
-        self.var_norm = tk.BooleanVar(value=True)
-        self.var_toc = tk.BooleanVar(value=True)
-        self.var_heights = tk.BooleanVar(value=True)
-        self.var_gantt = tk.BooleanVar(value=True)
+        self.var_sort = tk.BooleanVar(value=False)
+        self.var_norm = tk.BooleanVar(value=False)
+        self.var_toc = tk.BooleanVar(value=False)
+        self.var_heights = tk.BooleanVar(value=False)
+        self.var_gantt = tk.BooleanVar(value=False)
         self.var_diff = tk.BooleanVar(value=False)
 
         self._build_ui()
