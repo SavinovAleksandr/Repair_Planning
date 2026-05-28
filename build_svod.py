@@ -635,6 +635,14 @@ def classify(rec: dict) -> tuple[str, str]:
     return (GROUP_OTHER, section.strip())
 
 
+def _attach_classification(rec: dict) -> dict:
+    """Дополняет запись группой и объектом (ПС/ТЭЦ/ОЗ) для сортировки и сравнения."""
+    g, sub = classify(rec)
+    rec["group"] = g
+    rec["subgroup"] = sub or rec.get("section", "")
+    return rec
+
+
 # -------------------------------- ГРУППИРОВКА И СОРТИРОВКА РЕЗУЛЬТАТОВ ------
 
 def _norm(s: str) -> str:
@@ -2192,13 +2200,32 @@ def _norm_match_key(text: str) -> str:
     return s
 
 
-def record_match_key(rec: dict) -> tuple[str, str]:
-    return (str(rec.get("rdu") or ""), _norm_match_key(rec.get("name", "")))
+def object_context_key(rec: dict) -> str:
+    """Объект/ПС, к которому относится строка оборудования."""
+    sub = (rec.get("subgroup") or rec.get("section") or "").strip()
+    if sub:
+        return _norm(sub)
+    _g, sub2 = classify(rec)
+    return _norm(sub2) if sub2 else ""
+
+
+def record_match_key(rec: dict) -> tuple[str, str, str]:
+    """Ключ сопоставления: РДУ + объект + наименование оборудования."""
+    return (
+        str(rec.get("rdu") or ""),
+        object_context_key(rec),
+        _norm_match_key(rec.get("name", "")),
+    )
+
+
+def record_match_key_no_rdu(rec: dict) -> tuple[str, str]:
+    """Запасной ключ без РДУ (если в своднике неверно определён источник)."""
+    return (object_context_key(rec), _norm_match_key(rec.get("name", "")))
 
 
 def enrich_record_texts(rec: dict) -> dict:
     """Добавляет в запись текстовые поля A/H/N и даты для сравнения."""
-    out = dict(rec)
+    out = _attach_classification(dict(rec))
     ws = rec["src_ws"]
     row = rec["src_row"]
     layout = rec.get("layout")
@@ -2262,27 +2289,29 @@ def match_source_and_svod(source_recs: list[dict],
                                      DiffStats]:
     """Сопоставляет записи сводника с исходными проектами.
 
-    Сначала по паре (РДУ, наименование), затем — только по наименованию
-    среди оставшихся (на случай неточного определения РДУ в своднике).
+    Сначала по тройке (РДУ, объект, наименование), затем — по паре
+    (объект, наименование), если РДУ в своднике определён неточно.
+    Сопоставление только по наименованию без объекта не выполняется —
+    иначе «АТ-2» на разных ПС ошибочно считается одной строкой.
 
     Возвращает список (status, svod_rec|None, source_rec|None) и статистику.
     status: same | modified | new | deleted
     """
     from collections import defaultdict
 
-    pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    name_pool: dict[str, list[dict]] = defaultdict(list)
+    pool: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    obj_pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for s in source_recs:
         pool[record_match_key(s)].append(s)
-        name_pool[_norm_match_key(s.get("name", ""))].append(s)
+        obj_pool[record_match_key_no_rdu(s)].append(s)
 
     pairs: list[tuple[str, dict | None, dict | None]] = []
     stats = DiffStats()
 
     def _consume_source(src: dict) -> None:
         rk = record_match_key(src)
-        nk = _norm_match_key(src.get("name", ""))
-        for key, pd in ((rk, pool), (nk, name_pool)):
+        ok = record_match_key_no_rdu(src)
+        for key, pd in ((rk, pool), (ok, obj_pool)):
             lst = pd.get(key)
             if lst and src in lst:
                 lst.remove(src)
@@ -2296,18 +2325,18 @@ def match_source_and_svod(source_recs: list[dict],
     for sv in svod_recs:
         src = None
         rk = record_match_key(sv)
-        nk = _norm_match_key(sv.get("name", ""))
         lst = pool.get(rk)
         if lst:
             src = lst.pop(0)
             if not lst:
                 pool.pop(rk, None)
         if src is None:
-            lst = name_pool.get(nk)
+            ok = record_match_key_no_rdu(sv)
+            lst = obj_pool.get(ok)
             if lst:
                 src = lst.pop(0)
                 if not lst:
-                    name_pool.pop(nk, None)
+                    obj_pool.pop(ok, None)
         if src is not None:
             _consume_source(src)
             if src in unmatched_sources:
