@@ -816,6 +816,22 @@ def write_header(ws_komi: Worksheet, out_ws: Worksheet, header_last: int):
                 pass
 
 
+def _apply_table_header_center(ws: Worksheet, header_last: int) -> None:
+    """Выравнивание шапки таблицы (строки 1..header_last) по центру ячейки."""
+    for r in range(1, header_last + 1):
+        for c in range(1, TABLE_COLS + 1):
+            cell = ws.cell(r, c)
+            al = cell.alignment
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True if al is None or al.wrap_text is None else al.wrap_text,
+                text_rotation=al.text_rotation if al else 0,
+                shrink_to_fit=al.shrink_to_fit if al else False,
+                indent=al.indent if al else 0,
+            )
+
+
 def write_title(out_ws: Worksheet, month: int, year: int):
     """Обновляет тексты в шапке сводного графика.
 
@@ -851,16 +867,16 @@ def write_title(out_ws: Worksheet, month: int, year: int):
 
 
 def _apply_section_vertical_center(ws: Worksheet, row: int) -> None:
-    """Выравнивает текст заголовка/подзаголовка по центру строки."""
+    """Выравнивание заголовка/подзаголовка группы по центру ячейки."""
     cell = ws.cell(row, 1)
     al = cell.alignment
     cell.alignment = Alignment(
-        horizontal=al.horizontal or "left",
+        horizontal="center",
         vertical="center",
-        text_rotation=al.text_rotation,
-        wrap_text=al.wrap_text,
-        shrink_to_fit=al.shrink_to_fit,
-        indent=al.indent,
+        text_rotation=al.text_rotation if al else 0,
+        wrap_text=al.wrap_text if al else False,
+        shrink_to_fit=al.shrink_to_fit if al else False,
+        indent=al.indent if al else 0,
     )
 
 
@@ -872,8 +888,8 @@ def write_style_row(out_ws: Worksheet, row: int, text: str,
     стиль из строки-образца проекта. Если указан `height` — принудительно
     выставляет высоту строки (pt); иначе копирует высоту из образца.
 
-    `vertical_center=True` — текст по центру строки (как в ручном своднике
-    для «ПС 220 кВ Микунь» и аналогичных подзаголовков)."""
+    `vertical_center=True` — текст по центру ячейки (горизонтально и вертикально),
+    как в эталонном своднике для «ПС 220 кВ Микунь» и заголовков групп."""
     for c in range(1, TABLE_COLS + 1):
         copy_cell_style(src_ws.cell(style_row, c), out_ws.cell(row, c))
     cell = out_ws.cell(row, 1)
@@ -1656,6 +1672,7 @@ def build_output(priority: dict, records: list[dict],
     # Шапка.
     write_header(ws_komi, out_ws, style_info["header_last"])
     write_title(out_ws, month, year)
+    _apply_table_header_center(out_ws, style_info["header_last"])
 
     # Группированные записи.
     if apply_sort:
@@ -1958,6 +1975,7 @@ def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
         raise RuntimeError("В файле нет листа «Page1».")
     ws = wb["Page1"]
     header_last, data_last, _ = find_data_bounds(ws)
+    _apply_table_header_center(ws, header_last)
     label_set = {v.strip().lower() for v in GROUP_LABELS.values()}
 
     toc_row = header_last + 1
@@ -2615,6 +2633,7 @@ def _copy_header_block(src_ws: Worksheet, dst_ws: Worksheet,
                 dst_ws.merge_cells(rng)
             except Exception:
                 pass
+    _apply_table_header_center(dst_ws, header_last)
 
 
 def _copy_data_row_with_merges(src_ws: Worksheet, dst_ws: Worksheet,
@@ -2706,6 +2725,7 @@ def build_diff_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
         for sec_r in pending_sections:
             if sec_r not in copied_sections:
                 _copy_data_row_with_merges(svod_ws, diff_ws, sec_r, dst_row)
+                _apply_section_vertical_center(diff_ws, dst_row)
                 copied_sections.add(sec_r)
                 dst_row += 1
         pending_sections = []
