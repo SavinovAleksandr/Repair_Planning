@@ -154,11 +154,15 @@ DIFF_COLOR_ADD = "008000"          # зелёный текст (добавлен
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
 
 # Фразы, убираемые на листе «вставить в ПК Ремонты» (время/тип ремонта могут отличаться).
+_AG_KINDS = r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР|РЕК)"
 DIFF_COPY_STRIP_PATTERNS: list[re.Pattern] = [
     re.compile(
-        r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР)\.\s*А\.Г\.:\s*\d+\s*ч\.?",
+        rf"{_AG_KINDS}\.\s*А\.Г\.:\s*(?:\d+\s*ч\.?|ВЗ\.?)",
         re.IGNORECASE | re.UNICODE,
     ),
+    re.compile(r"А\.Г\.:\s*ВЗ\.?", re.IGNORECASE | re.UNICODE),
+    re.compile(r"А\.?Г\.?\s*[-–]\s*(?:\d+\s*ч\.?|ВЗ\.?)", re.IGNORECASE | re.UNICODE),
+    re.compile(r"\d+\s*мин\.?", re.IGNORECASE | re.UNICODE),
     re.compile(r"с\s+включением\s+на\s+ночь", re.IGNORECASE | re.UNICODE),
     re.compile(r"без\s+включения\s+на\s+ночь", re.IGNORECASE | re.UNICODE),
     re.compile(r"с\s+переводом\s+на\s+ОВ", re.IGNORECASE | re.UNICODE),
@@ -893,7 +897,7 @@ def write_title(out_ws: Worksheet, month: int, year: int):
 
 
 def _apply_section_vertical_center(ws: Worksheet, row: int) -> None:
-    """Выравнивание заголовка/подзаголовка группы по центру ячейки."""
+    """Заголовок группы: по центру и жирным."""
     cell = ws.cell(row, 1)
     al = cell.alignment
     cell.alignment = Alignment(
@@ -903,6 +907,13 @@ def _apply_section_vertical_center(ws: Worksheet, row: int) -> None:
         wrap_text=al.wrap_text if al else False,
         shrink_to_fit=al.shrink_to_fit if al else False,
         indent=al.indent if al else 0,
+    )
+    base = cell.font
+    cell.font = Font(
+        name=base.name if base and base.name else "Arial",
+        size=base.size if base and base.size else 10,
+        bold=True,
+        italic=base.italic if base else False,
     )
 
 
@@ -2509,16 +2520,9 @@ def _prepare_cell_font_for_rich(cell) -> Font:
 
 
 def _apply_rich_text_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Посимвольный rich text; сброс xf-стиля для отображения цветов в Excel."""
+    """Посимвольный rich text в top-left merge; без unmerge (Excel-safe)."""
     if _norm_match_key(old_t or "") == _norm_match_key(new_t or ""):
         return
-    ws = cell.parent
-    row, col = cell.row, cell.column
-    merged: list[str] = []
-    for mr in list(ws.merged_cells.ranges):
-        if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
-            merged.append(str(mr))
-            ws.unmerge_cells(str(mr))
     base_font = cell.font
     cell.value = _text_diff_rich(old_t, new_t, base_font)
     cell.font = _prepare_cell_font_for_rich(cell)
@@ -2531,14 +2535,6 @@ def _apply_rich_text_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -
             wrap_text=True,
             text_rotation=al.text_rotation if al else 0,
         )
-    if is_equipment_row(ws, row):
-        ensure_equipment_merges(ws, row)
-    elif merged:
-        for rng in merged:
-            try:
-                ws.merge_cells(rng)
-            except Exception:
-                pass
 
 
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
@@ -2582,8 +2578,13 @@ def _strip_copy_boilerplate(text: str) -> str:
     s = str(text or "")
     for pat in DIFF_COPY_STRIP_PATTERNS:
         s = pat.sub("", s)
+    lines: list[str] = []
+    for line in s.splitlines():
+        t = line.strip(" \t;,")
+        if t:
+            lines.append(t)
+    s = "\n".join(lines)
     s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n[ \t]+", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     s = re.sub(r"\s*;\s*;+", ";", s)
     return s.strip(" \t;,")
@@ -2782,8 +2783,8 @@ def _write_diff_clean_filter_note(ws: Worksheet, row: int) -> None:
     """Пояснение для листа чистового текста."""
     text = (
         "Чистый текст из сводного графика для копирования. "
-        "Удалены служебные фразы: «ТР. А.Г.: N ч.», «с включением на ночь», "
-        "«с переводом на ОВ» и аналоги."
+        "Удалены служебные фразы: «ТР. А.Г.: N ч.», «ВПр. А.Г.: ВЗ.», "
+        "«30 мин.», «с включением на ночь», «с переводом на ОВ» и аналоги."
     )
     cell = ws.cell(row, 1)
     cell.value = text
@@ -2800,7 +2801,7 @@ def _write_clean_sheet_legend(ws: Worksheet) -> None:
     cell = ws.cell(1, TABLE_COLS + 1)
     cell.value = (
         "Лист для копирования: plain text, без подсветки diff. "
-        "Столбцы H и N — без фраз А.Г./ночь/ОВ."
+        "Столбцы H и N — без фраз А.Г./ВЗ/мин./ночь/ОВ."
     )
     cell.font = Font(name="Arial", size=9, italic=True)
     cell.alignment = Alignment(wrap_text=True, vertical="top")
