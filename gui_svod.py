@@ -4,23 +4,15 @@ GUI-обёртка для сборщика сводного графика ре�
 
 Copyright (c) 2026 Савинов Александр, Сыктывкар. Все права защищены.
 
-Окно даёт несколько кнопок:
-  • «Сформировать сводный из проектов» — объединяет Арх + Коми (без сортировки
-    и оформления) в новый файл «Сводный график …xlsx» в корне.
-  • «Всё и сразу (пересобрать с нуля)» — запускает полный конвейер:
-    объединение → приоритеты → нормализация → оглавление → высоты → Гант.
-  • Чекбоксы + кнопка «Выполнить отмеченное» — точечные стадии над уже
-    существующим сводником (без пересборки с нуля):
-        ☑ Расстановка по приоритетам (полный rebuild из свода)
-        ☑ Нормализация текста H/N
-        ☑ Оглавление
-        ☑ Фиксация высот + wrap
-        ☑ Диаграмма Ганта
-  • «Откатить к предыдущей версии» — восстановление из backups/.
-  • «Открыть файл» / «Открыть папку» — быстрые ярлыки.
+Две основные кнопки:
+  • «Всё и сразу» — полный конвейер (объединение → приоритеты → нормализация
+    → оглавление → высоты → Гант → сравнение с проектами).
+  • «Выполнить отмеченное» — только отмеченные чекбоксы.
 
-Все операции выполняются в отдельном потоке, чтобы окно не зависало; лог
-и статус-строка обновляются из очереди сообщений.
+Чекбоксы: только объединение, приоритеты, нормализация, оглавление,
+высоты, Гант, сравнение с проектами.
+
+Также: откат из backups/, открыть сводник / папку.
 """
 from __future__ import annotations
 
@@ -114,15 +106,14 @@ class SvodApp(tk.Tk):
         self.msg_q: queue.Queue[tuple[str, str]] = queue.Queue()
         self.worker: threading.Thread | None = None
 
-        # Переменные чекбоксов «к существующему своднику».
+        # Переменные чекбоксов стадий.
+        self.var_merge = tk.BooleanVar(value=False)
         self.var_sort = tk.BooleanVar(value=True)
         self.var_norm = tk.BooleanVar(value=True)
         self.var_toc = tk.BooleanVar(value=True)
         self.var_heights = tk.BooleanVar(value=True)
         self.var_gantt = tk.BooleanVar(value=True)
         self.var_diff = tk.BooleanVar(value=False)
-        # Нормализация в «Всё и сразу».
-        self.var_all_norm = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._refresh_status()
@@ -152,70 +143,45 @@ class SvodApp(tk.Tk):
         ttk.Button(top, text="Открыть папку",
                    command=lambda: open_in_system(ROOT_DIR)).pack(side=tk.LEFT)
 
-        # Блок «Собрать из проектов».
-        g1 = ttk.LabelFrame(self, text="Сборка из проектов",
-                            padding=(PAD, PAD, PAD, PAD))
-        g1.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
+        # Блок операций: чекбоксы + две кнопки.
+        g_ops = ttk.LabelFrame(self, text="Операции", padding=(PAD, PAD, PAD, PAD))
+        g_ops.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
 
-        btn_merge = ttk.Button(
-            g1, text="Сформировать сводный (только объединение)",
-            command=self._on_merge_only)
-        btn_merge.pack(side=tk.LEFT, padx=(0, PAD))
-
-        btn_all = ttk.Button(
-            g1, text="Всё и сразу (пересобрать с нуля)",
-            command=self._on_all,
-            style="Accent.TButton")
-        btn_all.pack(side=tk.LEFT)
-
-        ttk.Checkbutton(
-            g1, text="С нормализацией текста",
-            variable=self.var_all_norm,
-        ).pack(side=tk.LEFT, padx=(PAD, 0))
-
-        # Блок «Применить к существующему своднику».
-        g2 = ttk.LabelFrame(
-            self, text="Применить к существующему своднику",
-            padding=(PAD, PAD, PAD, PAD))
-        g2.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
-
-        grid = ttk.Frame(g2)
+        grid = ttk.Frame(g_ops)
         grid.pack(fill=tk.X)
+        ttk.Checkbutton(grid, text="Только объединение",
+                        variable=self.var_merge).grid(
+            row=0, column=0, sticky="w", padx=(0, 16), pady=2)
         ttk.Checkbutton(grid, text="Расстановка по приоритетам",
                         variable=self.var_sort).grid(
-            row=0, column=0, sticky="w", padx=(0, 16), pady=2)
+            row=0, column=1, sticky="w", padx=(0, 16), pady=2)
         ttk.Checkbutton(grid, text="Нормализация текста (H/N)",
                         variable=self.var_norm).grid(
-            row=0, column=1, sticky="w", padx=(0, 16), pady=2)
+            row=1, column=0, sticky="w", padx=(0, 16), pady=2)
         ttk.Checkbutton(grid, text="Оглавление (TOC)",
                         variable=self.var_toc).grid(
-            row=1, column=0, sticky="w", padx=(0, 16), pady=2)
+            row=1, column=1, sticky="w", padx=(0, 16), pady=2)
         ttk.Checkbutton(grid, text="Фиксация высот + wrap",
                         variable=self.var_heights).grid(
-            row=1, column=1, sticky="w", padx=(0, 16), pady=2)
+            row=2, column=0, sticky="w", padx=(0, 16), pady=2)
         ttk.Checkbutton(grid, text="Диаграмма Ганта",
                         variable=self.var_gantt).grid(
-            row=2, column=0, sticky="w", padx=(0, 16), pady=2)
-
-        btn_gantt = ttk.Button(
-            grid, text="Обновить диаграмму Ганта",
-            command=self._on_refresh_gantt)
-        btn_gantt.grid(row=2, column=1, sticky="w", pady=2)
-
-        ttk.Checkbutton(grid, text="Сравнение с проектами (новая вкладка)",
+            row=2, column=1, sticky="w", padx=(0, 16), pady=2)
+        ttk.Checkbutton(grid, text="Сравнение с проектами",
                         variable=self.var_diff).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=2)
 
-        btn_diff = ttk.Button(
-            grid, text="Построить сравнение с Коми/Арх",
-            command=self._on_build_diff)
-        btn_diff.grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
-
-        btn_apply = ttk.Button(
-            g2, text="Выполнить отмеченное",
+        btns = ttk.Frame(g_ops)
+        btns.pack(fill=tk.X, pady=(PAD, 0))
+        ttk.Button(
+            btns, text="Всё и сразу",
+            command=self._on_all,
+            style="Accent.TButton",
+        ).pack(side=tk.LEFT, padx=(0, PAD))
+        ttk.Button(
+            btns, text="Выполнить отмеченное",
             command=self._on_apply_selected,
-            style="Accent.TButton")
-        btn_apply.pack(anchor="e", pady=(PAD, 0))
+        ).pack(side=tk.LEFT)
 
         # Откат + открыть файл.
         g3 = ttk.Frame(self, padding=(PAD, PAD, PAD, 0))
@@ -259,7 +225,7 @@ class SvodApp(tk.Tk):
         svod = bs.find_existing_svod(ROOT_DIR)
         if svod is None:
             self.status_var.set("Сводник в папке не найден. "
-                                "Доступна только «Сборка из проектов».")
+                                "Отметьте «Только объединение» или «Всё и сразу».")
         else:
             mt = datetime.fromtimestamp(svod.stat().st_mtime).strftime(
                 "%Y-%m-%d %H:%M:%S")
@@ -338,170 +304,123 @@ class SvodApp(tk.Tk):
 
     # --- кнопки -----------------------------------------------------------
 
-    def _on_merge_only(self) -> None:
-        """Чистое объединение проектов без сортировки/TOC/Ганта/высот."""
-        svod = bs.find_existing_svod(ROOT_DIR)
-        if svod is not None:
-            ok = messagebox.askyesno(
-                "Перезаписать сводник?",
-                f"В папке уже есть файл:\n{svod.name}\n\n"
-                "«Сформировать» пересоздаст его из проектов Арх/Коми — "
-                "ручные правки в нём пропадут (старая версия попадёт в backups/).\n\n"
-                "Продолжить?",
+    def _confirm_overwrite(self, svod: Path | None) -> bool:
+        if svod is None:
+            return True
+        return messagebox.askyesno(
+            "Перезаписать сводник?",
+            f"В папке уже есть файл:\n{svod.name}\n\n"
+            "Операция пересоздаст его — ручные правки пропадут "
+            "(старая версия попадёт в backups/).\n\n"
+            "Продолжить?",
+        )
+
+    def _run_diff(self, svod: Path) -> None:
+        p_komi = bs.find_file(bs.FILE_KOMI)
+        p_arkh = bs.find_file(bs.FILE_ARKH)
+        if not p_komi and not p_arkh:
+            raise RuntimeError(
+                "Для сравнения положите в папку файлы "
+                f"«{bs.FILE_KOMI}» и/или «{bs.FILE_ARKH}»."
             )
-            if not ok:
-                return
-
-        opts = bs.NormOptions(enabled=self.var_all_norm.get())
-        stats = bs.NormStats()
-
-        def run():
-            self._push("log", "=== Сформировать сводный (только объединение) ===")
-            out = bs.stage_full_rebuild(
-                ROOT_DIR, None, opts, stats, log=self._log_fn,
-                apply_sort=False, apply_toc=False,
-                apply_heights=False, apply_gantt=False,
-            )
-            self._push("log", f"Готов файл: {out.name}")
-            self._report_norm(stats)
-
-        self._run_in_thread(run)
+        self._push("log", "→ Сравнение с проектами")
+        stats = bs.stage_build_diff_inplace(
+            svod, ROOT_DIR, None, log=self._log_fn)
+        self._push(
+            "log",
+            f"  изменено {stats.modified}, новых {stats.new_in_svod}, "
+            f"удалено из проектов {stats.deleted_from_source}. "
+            f"Вкладки «{bs.DIFF_SHEET_NAME}» и «{bs.DIFF_CLEAN_SHEET_NAME}».",
+        )
 
     def _on_all(self) -> None:
-        """Полная пересборка с нуля."""
+        """Полный конвейер: всё сразу."""
         svod = bs.find_existing_svod(ROOT_DIR)
-        if svod is not None:
-            ok = messagebox.askyesno(
-                "Перезаписать сводник?",
-                f"В папке уже есть файл:\n{svod.name}\n\n"
-                "Пересобрать его заново из проектов (ручные правки пропадут, "
-                "старая версия уедет в backups/)?",
-            )
-            if not ok:
-                return
-
-        opts = bs.NormOptions(enabled=self.var_all_norm.get())
-        stats = bs.NormStats()
-
-        def run():
-            self._push("log", "=== Всё и сразу: пересборка с нуля ===")
-            out = bs.stage_full_rebuild(
-                ROOT_DIR, None, opts, stats, log=self._log_fn,
-                apply_sort=True, apply_toc=True,
-                apply_heights=True, apply_gantt=True,
-            )
-            self._push("log", f"Готов файл: {out.name}")
-            self._report_norm(stats)
-
-        self._run_in_thread(run)
-
-    def _on_apply_selected(self) -> None:
-        """Применить отмеченные стадии к существующему своднику."""
-        svod = bs.find_existing_svod(ROOT_DIR)
-        if svod is None:
-            messagebox.showerror(
-                "Нет сводника",
-                f"В папке {ROOT_DIR} не найден «Сводный график …xlsx».\n\n"
-                "Сначала нажмите «Сформировать» или «Всё и сразу».",
-            )
-            return
-
-        do_sort = self.var_sort.get()
-        do_norm = self.var_norm.get()
-        do_toc = self.var_toc.get()
-        do_heights = self.var_heights.get()
-        do_gantt = self.var_gantt.get()
-        do_diff = self.var_diff.get()
-        if not any([do_sort, do_norm, do_toc, do_heights, do_gantt, do_diff]):
-            messagebox.showinfo("Ничего не выбрано",
-                                "Отметьте хотя бы одну стадию.")
+        if not self._confirm_overwrite(svod):
             return
 
         opts = bs.NormOptions(enabled=True)
         stats = bs.NormStats()
 
         def run():
-            nonlocal svod
-            self._push("log", "=== Применить отмеченные стадии ===")
-            # Если нужна расстановка — делаем полный rebuild из существующего:
-            # он заодно пересчитает всё остальное (TOC/высоты/Гант).
-            if do_sort:
-                self._push("log", "→ Расстановка по приоритетам (rebuild)")
-                svod = bs.stage_rebuild_from_existing(
-                    svod, None, opts, stats, log=self._log_fn)
-                # После rebuild остальные стадии-inplace могут быть не нужны —
-                # запустим их только если пользователь всё ещё хочет
-                # (например, выключил в rebuild нормализацию).
-            if do_norm and not do_sort:
-                # Если был sort, нормализация уже применена в rebuild.
-                self._push("log", "→ Нормализация текста")
-                bs.stage_normalize_inplace(svod, opts, stats, log=self._log_fn)
-            if do_toc and not do_sort:
-                self._push("log", "→ Оглавление")
-                bs.stage_build_toc_inplace(svod, log=self._log_fn)
-            if do_heights and not do_sort:
-                self._push("log", "→ Фиксация высот + wrap")
-                bs.stage_set_heights_inplace(svod, log=self._log_fn)
-            if do_gantt and not do_sort:
-                self._push("log", "→ Диаграмма Ганта (актуальные даты с Page1)")
-                bs.stage_build_gantt_inplace(
-                    svod, None, log=self._log_fn)
-            if do_diff and not do_sort:
-                self._push("log", "→ Сравнение с проектами (новая вкладка)")
-                bs.stage_build_diff_inplace(
-                    svod, ROOT_DIR, None, log=self._log_fn)
+            self._push("log", "=== Всё и сразу ===")
+            out = bs.stage_full_rebuild(
+                ROOT_DIR, None, opts, stats, log=self._log_fn,
+                apply_sort=True, apply_toc=True,
+                apply_heights=True, apply_gantt=True,
+            )
+            self._push("log", f"Готов файл: {out.name}")
+            self._run_diff(out)
             self._report_norm(stats)
 
         self._run_in_thread(run)
 
-    def _on_refresh_gantt(self) -> None:
-        """Перестроить только лист «Диаграмма» по текущим датам на Page1."""
+    def _on_apply_selected(self) -> None:
+        """Выполнить только отмеченные стадии."""
+        do_merge = self.var_merge.get()
+        do_sort = self.var_sort.get()
+        do_norm = self.var_norm.get()
+        do_toc = self.var_toc.get()
+        do_heights = self.var_heights.get()
+        do_gantt = self.var_gantt.get()
+        do_diff = self.var_diff.get()
+
+        if not any([do_merge, do_sort, do_norm, do_toc,
+                    do_heights, do_gantt, do_diff]):
+            messagebox.showinfo("Ничего не выбрано",
+                                "Отметьте хотя бы одну операцию.")
+            return
+
         svod = bs.find_existing_svod(ROOT_DIR)
-        if svod is None:
+        if do_merge:
+            if not self._confirm_overwrite(svod):
+                return
+        elif svod is None:
             messagebox.showerror(
                 "Нет сводника",
-                f"В папке {ROOT_DIR} не найден «Сводный график …xlsx».",
+                f"В папке {ROOT_DIR} не найден «Сводный график …xlsx».\n\n"
+                "Отметьте «Только объединение» или нажмите «Всё и сразу».",
             )
             return
+
+        opts = bs.NormOptions(enabled=do_norm)
+        stats = bs.NormStats()
 
         def run():
-            self._push("log", "=== Обновление диаграммы Ганта ===")
-            self._push("log",
-                       "Читаю даты начала/окончания (F/G) с листа Page1…")
-            bs.stage_build_gantt_inplace(svod, None, log=self._log_fn)
-            self._push("log", "Готово. Откройте лист «Диаграмма» в своднике.")
+            nonlocal svod
+            self._push("log", "=== Выполнить отмеченное ===")
 
-        self._run_in_thread(run)
+            if do_merge:
+                self._push("log", "→ Объединение проектов Арх/Коми")
+                svod = bs.stage_full_rebuild(
+                    ROOT_DIR, None, opts, stats, log=self._log_fn,
+                    apply_sort=do_sort,
+                    apply_toc=do_toc and not do_sort,
+                    apply_heights=do_heights and not do_sort,
+                    apply_gantt=do_gantt and not do_sort,
+                )
+                self._push("log", f"  файл: {svod.name}")
+            elif do_sort:
+                self._push("log", "→ Расстановка по приоритетам (rebuild)")
+                svod = bs.stage_rebuild_from_existing(
+                    svod, None, opts, stats, log=self._log_fn)
 
-    def _on_build_diff(self) -> None:
-        """Лист «Сравнение с проектами» — diff сводника vs Коми/Арх."""
-        svod = bs.find_existing_svod(ROOT_DIR)
-        if svod is None:
-            messagebox.showerror(
-                "Нет сводника",
-                f"В папке {ROOT_DIR} не найден «Сводный график …xlsx».",
-            )
-            return
-        p_komi = bs.find_file(bs.FILE_KOMI)
-        p_arkh = bs.find_file(bs.FILE_ARKH)
-        if not p_komi and not p_arkh:
-            messagebox.showerror(
-                "Нет исходников",
-                "Для сравнения положите в папку файлы\n"
-                f"«{bs.FILE_KOMI}» и/или «{bs.FILE_ARKH}».",
-            )
-            return
+            if do_norm and not do_merge and not do_sort:
+                self._push("log", "→ Нормализация текста")
+                bs.stage_normalize_inplace(svod, opts, stats, log=self._log_fn)
+            if do_toc and not do_merge and not do_sort:
+                self._push("log", "→ Оглавление")
+                bs.stage_build_toc_inplace(svod, log=self._log_fn)
+            if do_heights and not do_merge and not do_sort:
+                self._push("log", "→ Фиксация высот + wrap")
+                bs.stage_set_heights_inplace(svod, log=self._log_fn)
+            if do_gantt and not do_merge and not do_sort:
+                self._push("log", "→ Диаграмма Ганта")
+                bs.stage_build_gantt_inplace(svod, None, log=self._log_fn)
+            if do_diff:
+                self._run_diff(svod)
 
-        def run():
-            self._push("log", "=== Сравнение с исходными проектами ===")
-            stats = bs.stage_build_diff_inplace(
-                svod, ROOT_DIR, None, log=self._log_fn)
-            self._push(
-                "log",
-                f"Итого: изменено {stats.modified}, новых {stats.new_in_svod}, "
-                f"удалено из проектов {stats.deleted_from_source}. "
-                f"Откройте вкладку «{bs.DIFF_SHEET_NAME}».",
-            )
+            self._report_norm(stats)
 
         self._run_in_thread(run)
 
