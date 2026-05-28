@@ -639,7 +639,11 @@ def _attach_classification(rec: dict) -> dict:
     """Дополняет запись группой и объектом (ПС/ТЭЦ/ОЗ) для сортировки и сравнения."""
     g, sub = classify(rec)
     rec["group"] = g
-    rec["subgroup"] = sub or rec.get("section", "")
+    # ЛЭП и АЧР в своднике без подзаголовков объектов — объект не используем.
+    if g in (GROUP_LEP220, GROUP_LEP110, GROUP_ACHR):
+        rec["subgroup"] = ""
+    else:
+        rec["subgroup"] = sub or rec.get("section", "")
     return rec
 
 
@@ -2200,8 +2204,23 @@ def _norm_match_key(text: str) -> str:
     return s
 
 
+def _record_group(rec: dict) -> str:
+    g = rec.get("group")
+    if g:
+        return str(g)
+    g, _sub = classify(rec)
+    return g
+
+
+def is_flat_match_group(rec: dict) -> bool:
+    """Группы без привязки к ПС: сопоставление по наименованию, не по объекту."""
+    return _record_group(rec) in (GROUP_LEP220, GROUP_LEP110, GROUP_ACHR)
+
+
 def object_context_key(rec: dict) -> str:
     """Объект/ПС, к которому относится строка оборудования."""
+    if is_flat_match_group(rec):
+        return ""
     sub = (rec.get("subgroup") or rec.get("section") or "").strip()
     if sub:
         return _norm(sub)
@@ -2289,10 +2308,10 @@ def match_source_and_svod(source_recs: list[dict],
                                      DiffStats]:
     """Сопоставляет записи сводника с исходными проектами.
 
-    Сначала по тройке (РДУ, объект, наименование), затем — по паре
-    (объект, наименование), если РДУ в своднике определён неточно.
-    Сопоставление только по наименованию без объекта не выполняется —
-    иначе «АТ-2» на разных ПС ошибочно считается одной строкой.
+    Для оборудования на ПС — (РДУ, объект, наименование), затем (объект,
+    наименование) при неточном РДУ в своднике.
+    Для ЛЭП/АЧР — (РДУ, наименование), затем только наименование (в своднике
+    нет подзаголовков объектов; в исходнике они служебные).
 
     Возвращает список (status, svod_rec|None, source_rec|None) и статистику.
     status: same | modified | new | deleted
@@ -2301,9 +2320,13 @@ def match_source_and_svod(source_recs: list[dict],
 
     pool: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
     obj_pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    flat_name_pool: dict[str, list[dict]] = defaultdict(list)
     for s in source_recs:
         pool[record_match_key(s)].append(s)
-        obj_pool[record_match_key_no_rdu(s)].append(s)
+        if not is_flat_match_group(s):
+            obj_pool[record_match_key_no_rdu(s)].append(s)
+        else:
+            flat_name_pool[_norm_match_key(s.get("name", ""))].append(s)
 
     pairs: list[tuple[str, dict | None, dict | None]] = []
     stats = DiffStats()
@@ -2311,7 +2334,11 @@ def match_source_and_svod(source_recs: list[dict],
     def _consume_source(src: dict) -> None:
         rk = record_match_key(src)
         ok = record_match_key_no_rdu(src)
-        for key, pd in ((rk, pool), (ok, obj_pool)):
+        nk = _norm_match_key(src.get("name", ""))
+        pools = [(rk, pool), (ok, obj_pool)]
+        if is_flat_match_group(src):
+            pools.append((nk, flat_name_pool))
+        for key, pd in pools:
             lst = pd.get(key)
             if lst and src in lst:
                 lst.remove(src)
@@ -2330,13 +2357,20 @@ def match_source_and_svod(source_recs: list[dict],
             src = lst.pop(0)
             if not lst:
                 pool.pop(rk, None)
-        if src is None:
+        if src is None and not is_flat_match_group(sv):
             ok = record_match_key_no_rdu(sv)
             lst = obj_pool.get(ok)
             if lst:
                 src = lst.pop(0)
                 if not lst:
                     obj_pool.pop(ok, None)
+        if src is None and is_flat_match_group(sv):
+            nk = _norm_match_key(sv.get("name", ""))
+            lst = flat_name_pool.get(nk)
+            if lst:
+                src = lst.pop(0)
+                if not lst:
+                    flat_name_pool.pop(nk, None)
         if src is not None:
             _consume_source(src)
             if src in unmatched_sources:
