@@ -41,7 +41,6 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.styles.colors import Color
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.cell.text import InlineFont
 from openpyxl.utils import get_column_letter
@@ -148,6 +147,9 @@ DIFF_CLEAN_SHEET_NAME = "вставить в ПК Ремонты"
 DIFF_FILL_DELETED_ROW = "FFC7CE"   # светло-красная заливка удалённых строк
 DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые строки в своднике
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
+DIFF_FILL_TEXT = PatternFill(
+    fill_type="solid", start_color="FFFFFFFF", end_color="FFFFFFFF",
+)
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
 
@@ -2442,7 +2444,7 @@ def _inline_font(base: Font | None, *, color: str | None = None,
     size = base.size if base and base.size else 10.0
     kw: dict = {"rFont": name, "sz": size}
     if color:
-        kw["color"] = Color(rgb=f"00{color}" if len(color) == 6 else color)
+        kw["color"] = f"00{color}" if len(color) == 6 else color
     if strike:
         kw["strike"] = True
     if bold:
@@ -2495,6 +2497,50 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
     return CellRichText(blocks)
 
 
+def _prepare_cell_font_for_rich(cell) -> Font:
+    """Базовый шрифт ячейки без цвета — иначе Excel может скрыть цвета run'ов."""
+    base = cell.font
+    return Font(
+        name=base.name if base and base.name else "Arial",
+        size=base.size if base and base.size else 10,
+        bold=base.bold if base else False,
+        italic=base.italic if base else False,
+    )
+
+
+def _apply_rich_text_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
+    """Посимвольный rich text; сброс xf-стиля для отображения цветов в Excel."""
+    if _norm_match_key(old_t or "") == _norm_match_key(new_t or ""):
+        return
+    ws = cell.parent
+    row, col = cell.row, cell.column
+    merged: list[str] = []
+    for mr in list(ws.merged_cells.ranges):
+        if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
+            merged.append(str(mr))
+            ws.unmerge_cells(str(mr))
+    base_font = cell.font
+    cell.value = _text_diff_rich(old_t, new_t, base_font)
+    cell.font = _prepare_cell_font_for_rich(cell)
+    cell.fill = DIFF_FILL_TEXT
+    if wrap:
+        al = cell.alignment
+        cell.alignment = Alignment(
+            horizontal=al.horizontal if al and al.horizontal else "left",
+            vertical="center",
+            wrap_text=True,
+            text_rotation=al.text_rotation if al else 0,
+        )
+    if is_equipment_row(ws, row):
+        ensure_equipment_merges(ws, row)
+    elif merged:
+        for rng in merged:
+            try:
+                ws.merge_cells(rng)
+            except Exception:
+                pass
+
+
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
                         new_d: tuple | None, base_font: Font | None
                         ) -> CellRichText | str:
@@ -2523,6 +2569,7 @@ def _apply_date_cell_diff(cell, old_show: str, new_show: str) -> None:
         return
     cell.value = _format_date_change(
         old_show, new_show, None, None, cell.font)
+    cell.font = _prepare_cell_font_for_rich(cell)
     cell.fill = PatternFill(
         start_color=DIFF_FILL_DATE_CHG,
         end_color=DIFF_FILL_DATE_CHG,
@@ -2619,11 +2666,12 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
 
     # A, H, N — посимвольный diff (как в 839677f): без заливки ячейки.
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
-        cell = ws.cell(row, col)
-        old_t = source.get(fld, "")
-        new_t = svod.get(fld, "")
-        if _norm_match_key(old_t) != _norm_match_key(new_t):
-            cell.value = _text_diff_rich(old_t, new_t, cell.font)
+        _apply_rich_text_diff(
+            ws.cell(row, col),
+            source.get(fld, ""),
+            svod.get(fld, ""),
+            wrap=(col in (8, layout.col_repair)),
+        )
 
     # E — кол-во дней (жёлтая заливка, как F/G).
     _apply_date_cell_diff(
