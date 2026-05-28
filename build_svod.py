@@ -41,6 +41,7 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles.colors import Color
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.cell.text import InlineFont
 from openpyxl.utils import get_column_letter
@@ -148,6 +149,8 @@ DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые 
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
+# Колонки с merge в строке оборудования — rich text ломает Excel (sheet3.xml).
+DIFF_MERGED_TEXT_COLS = {1, 8, 14}
 
 BACKUP_DIR = ROOT / "backups"
 SVOD_FILE_PREFIX = "Сводный график ремонтов"
@@ -2417,7 +2420,7 @@ def _inline_font(base: Font | None, *, color: str | None = None,
     size = base.size if base and base.size else 10.0
     kw: dict = {"rFont": name, "sz": size}
     if color:
-        kw["color"] = color
+        kw["color"] = Color(rgb=f"00{color}" if len(color) == 6 else color)
     if strike:
         kw["strike"] = True
     if bold:
@@ -2472,22 +2475,17 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
 
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
                         new_d: tuple | None, base_font: Font | None
-                        ) -> CellRichText | str:
-    """Ячейка даты: новое значение + подсветка; при изменении — было → стало."""
+                        ) -> str:
+    """Ячейка даты: plain text «было → стало» (без rich text — совместимость Excel)."""
     new_show = new_t or (format_date_tuple(new_d) if new_d else "")
     old_show = old_t or (format_date_tuple(old_d) if old_d else "")
     if _norm_match_key(old_show) == _norm_match_key(new_show):
         return new_show
     if not old_show:
-        return _text_diff_rich("", new_show, base_font)
+        return new_show
     if not new_show:
-        return CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                      old_show),
-        ])
-    combined_old = f"{old_show} → "
-    combined_new = f"{old_show} → {new_show}"
-    return _text_diff_rich(combined_old, combined_new, base_font)
+        return old_show
+    return f"{old_show} → {new_show}"
 
 
 def format_date_tuple(d: tuple[int, int, int] | None) -> str:
@@ -2523,14 +2521,24 @@ def _apply_strikethrough_row(ws: Worksheet, row: int,
         )
 
 
+def _set_plain_changed_cell(cell, new_t: str) -> None:
+    """Текст изменения без rich text (для объединённых ячеек A/H/N)."""
+    cell.value = new_t if new_t else None
+    cell.fill = PatternFill(
+        start_color=DIFF_FILL_DATE_CHG,
+        end_color=DIFF_FILL_DATE_CHG,
+        fill_type="solid",
+    )
+
+
 def _write_diff_legend(ws: Worksheet) -> None:
     """Легенда в правом верхнем углу листа сравнения."""
     legend = (
         "Легенда:  "
         "только изменённые строки;  "
-        "зелёный — добавленный текст;  "
-        "красный зачёркнутый — удалённый;  "
-        "жёлтая заливка — изменённые даты;  "
+        "зелёный — добавленный текст (даты);  "
+        "красный зачёркнутый — удалённый (даты);  "
+        "жёлтая заливка — изменённые даты и текст (A/H/N);  "
         "зелёная строка — новая в своднике;  "
         "красная строка — удалена из проекта"
     )
@@ -2553,14 +2561,13 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # Текстовые колонки A, H, N — посимвольный diff.
+    # Текстовые колонки A, H, N — diff без rich text в merge (Excel sheet3).
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
         cell = ws.cell(row, col)
         old_t = source.get(fld, "")
         new_t = svod.get(fld, "")
         if _norm_match_key(old_t) != _norm_match_key(new_t):
-            rich = _text_diff_rich(old_t, new_t, cell.font)
-            cell.value = rich
+            _set_plain_changed_cell(cell, new_t)
 
     # Даты F/G.
     for col, fld_t, fld_d in (
@@ -2572,14 +2579,23 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
         new_t = svod.get(fld_t, "")
         if (not _dates_equal(svod.get(fld_d), source.get(fld_d))
                 or _norm_match_key(old_t) != _norm_match_key(new_t)):
-            cell.value = _format_date_change(
+            new_show = _format_date_change(
                 old_t, new_t, source.get(fld_d), svod.get(fld_d), cell.font,
             )
+            cell.value = new_show
             cell.fill = PatternFill(
                 start_color=DIFF_FILL_DATE_CHG,
                 end_color=DIFF_FILL_DATE_CHG,
                 fill_type="solid",
             )
+            if not (new_t or svod.get(fld_d)) and (old_t or source.get(fld_d)):
+                base = cell.font
+                cell.font = Font(
+                    name=base.name if base else "Arial",
+                    size=base.size if base else 10,
+                    strike=True,
+                    color=DIFF_COLOR_DEL,
+                )
 
 
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
