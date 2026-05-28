@@ -144,13 +144,24 @@ GANTT_COLOR_WEEKEND = "F2F2F2"
 GANTT_SHEET_NAME = "Диаграмма"
 
 DIFF_SHEET_NAME = "Сравнение с проектами"
+DIFF_CLEAN_SHEET_NAME = "Сравнение — копирование"
 DIFF_FILL_DELETED_ROW = "FFC7CE"   # светло-красная заливка удалённых строк
 DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые строки в своднике
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
-# Колонки с merge в строке оборудования — rich text ломает Excel (sheet3.xml).
-DIFF_MERGED_TEXT_COLS = {1, 8, 14}
+
+# Фразы, убираемые на листе «Сравнение — копирование» (время/тип ремонта могут отличаться).
+DIFF_COPY_STRIP_PATTERNS: list[re.Pattern] = [
+    re.compile(
+        r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР)\.\s*А\.Г\.:\s*\d+\s*ч\.?",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    re.compile(r"с\s+включением\s+на\s+ночь", re.IGNORECASE | re.UNICODE),
+    re.compile(r"без\s+включения\s+на\s+ночь", re.IGNORECASE | re.UNICODE),
+    re.compile(r"с\s+переводом\s+на\s+ОВ", re.IGNORECASE | re.UNICODE),
+    re.compile(r"с\s+переводом\s+на\s+ОШВ", re.IGNORECASE | re.UNICODE),
+]
 
 BACKUP_DIR = ROOT / "backups"
 SVOD_FILE_PREFIX = "Сводный график ремонтов"
@@ -208,6 +219,8 @@ def _cell_text_with_merges(ws: Worksheet, row: int, col: int) -> str:
     вернёт текст «владельца» объединения (top-left-ячейки)."""
     v = ws.cell(row, col).value
     if v is not None and str(v).strip() != "":
+        if isinstance(v, CellRichText):
+            return str(v)
         return str(v)
     for mr in ws.merged_cells.ranges:
         if mr.min_row <= row <= mr.max_row and mr.min_col <= col <= mr.max_col:
@@ -2475,17 +2488,34 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
 
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
                         new_d: tuple | None, base_font: Font | None
-                        ) -> str:
-    """Ячейка даты: plain text «было → стало» (без rich text — совместимость Excel)."""
+                        ) -> CellRichText | str:
+    """Ячейка даты: rich text с зелёными/красными фрагментами (F/G не merged)."""
     new_show = new_t or (format_date_tuple(new_d) if new_d else "")
     old_show = old_t or (format_date_tuple(old_d) if old_d else "")
     if _norm_match_key(old_show) == _norm_match_key(new_show):
         return new_show
     if not old_show:
-        return new_show
+        return _text_diff_rich("", new_show, base_font)
     if not new_show:
-        return old_show
-    return f"{old_show} → {new_show}"
+        return CellRichText([
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                      old_show),
+        ])
+    combined_old = f"{old_show} → "
+    combined_new = f"{old_show} → {new_show}"
+    return _text_diff_rich(combined_old, combined_new, base_font)
+
+
+def _strip_copy_boilerplate(text: str) -> str:
+    """Убирает служебные фразы А.Г./ночь/ОВ для листа копирования."""
+    s = str(text or "")
+    for pat in DIFF_COPY_STRIP_PATTERNS:
+        s = pat.sub("", s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n[ \t]+", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"\s*;\s*;+", ";", s)
+    return s.strip(" \t;,")
 
 
 def format_date_tuple(d: tuple[int, int, int] | None) -> str:
@@ -2521,14 +2551,16 @@ def _apply_strikethrough_row(ws: Worksheet, row: int,
         )
 
 
-def _set_plain_changed_cell(cell, new_t: str) -> None:
-    """Текст изменения без rich text (для объединённых ячеек A/H/N)."""
-    cell.value = new_t if new_t else None
-    cell.fill = PatternFill(
-        start_color=DIFF_FILL_DATE_CHG,
-        end_color=DIFF_FILL_DATE_CHG,
-        fill_type="solid",
-    )
+def _unmerge_equipment_row(ws: Worksheet, row: int) -> None:
+    """Снимает merge A:D / H:M / N:O / X:Y — rich text в merge ломает Excel."""
+    for lo, hi in EQUIPMENT_MERGES:
+        for mr in list(ws.merged_cells.ranges):
+            if (mr.min_row == row and mr.max_row == row
+                    and not (mr.max_col < lo or mr.min_col > hi)):
+                try:
+                    ws.unmerge_cells(str(mr))
+                except Exception:
+                    pass
 
 
 def _write_diff_legend(ws: Worksheet) -> None:
@@ -2536,9 +2568,9 @@ def _write_diff_legend(ws: Worksheet) -> None:
     legend = (
         "Легенда:  "
         "только изменённые строки;  "
-        "зелёный — добавленный текст (даты);  "
-        "красный зачёркнутый — удалённый (даты);  "
-        "жёлтая заливка — изменённые даты и текст (A/H/N);  "
+        "зелёный — добавленный текст;  "
+        "красный зачёркнутый — удалённый;  "
+        "жёлтая заливка — изменённые даты;  "
         "зелёная строка — новая в своднике;  "
         "красная строка — удалена из проекта"
     )
@@ -2561,13 +2593,13 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # Текстовые колонки A, H, N — diff без rich text в merge (Excel sheet3).
+    # Текстовые колонки A, H, N — посимвольный diff (после unmerge строки).
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
         cell = ws.cell(row, col)
         old_t = source.get(fld, "")
         new_t = svod.get(fld, "")
         if _norm_match_key(old_t) != _norm_match_key(new_t):
-            _set_plain_changed_cell(cell, new_t)
+            cell.value = _text_diff_rich(old_t, new_t, cell.font)
 
     # Даты F/G.
     for col, fld_t, fld_d in (
@@ -2579,23 +2611,14 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
         new_t = svod.get(fld_t, "")
         if (not _dates_equal(svod.get(fld_d), source.get(fld_d))
                 or _norm_match_key(old_t) != _norm_match_key(new_t)):
-            new_show = _format_date_change(
+            cell.value = _format_date_change(
                 old_t, new_t, source.get(fld_d), svod.get(fld_d), cell.font,
             )
-            cell.value = new_show
             cell.fill = PatternFill(
                 start_color=DIFF_FILL_DATE_CHG,
                 end_color=DIFF_FILL_DATE_CHG,
                 fill_type="solid",
             )
-            if not (new_t or svod.get(fld_d)) and (old_t or source.get(fld_d)):
-                base = cell.font
-                cell.font = Font(
-                    name=base.name if base else "Arial",
-                    size=base.size if base else 10,
-                    strike=True,
-                    color=DIFF_COLOR_DEL,
-                )
 
 
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
@@ -2678,6 +2701,117 @@ def _write_diff_filter_note(ws: Worksheet, row: int) -> None:
     ws.row_dimensions[row].height = 16.0
 
 
+def _write_diff_clean_filter_note(ws: Worksheet, row: int) -> None:
+    """Пояснение для листа чистового текста."""
+    text = (
+        "Чистый текст из сводного графика для копирования. "
+        "Удалены служебные фразы: «ТР. А.Г.: N ч.», «с включением на ночь», "
+        "«с переводом на ОВ» и аналоги."
+    )
+    cell = ws.cell(row, 1)
+    cell.value = text
+    cell.font = Font(name="Arial", size=9, italic=True, color="444444")
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    try:
+        ws.merge_cells(f"A{row}:{LAST_COL_LETTER}{row}")
+    except Exception:
+        pass
+    ws.row_dimensions[row].height = 28.0
+
+
+def _write_clean_sheet_legend(ws: Worksheet) -> None:
+    cell = ws.cell(1, TABLE_COLS + 1)
+    cell.value = (
+        "Лист для копирования: plain text, без подсветки diff. "
+        "Столбцы H и N — без фраз А.Г./ночь/ОВ."
+    )
+    cell.font = Font(name="Arial", size=9, italic=True)
+    cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions[get_column_letter(TABLE_COLS + 1)].width = 48
+
+
+def _write_clean_equipment_row(clean_ws: Worksheet, svod_ws: Worksheet,
+                               sv_row: int | None, dst_row: int, *,
+                               source_rec: dict | None = None) -> None:
+    """Строка оборудования на листе копирования — plain text, без служебных фраз."""
+    layout = detect_project_layout(svod_ws)
+    if sv_row is not None:
+        copy_row_full(svod_ws, sv_row, clean_ws, dst_row)
+        copy_merges_in_row(svod_ws, sv_row, clean_ws, dst_row)
+        ensure_equipment_merges(clean_ws, dst_row)
+        h_raw = _cell_text_with_merges(svod_ws, sv_row, 8)
+        n_raw = _cell_text_with_merges(svod_ws, sv_row, layout.col_repair)
+    else:
+        assert source_rec is not None
+        src_ws = source_rec["src_ws"]
+        src_row = source_rec["src_row"]
+        copy_row_full(src_ws, src_row, clean_ws, dst_row)
+        copy_merges_in_row(src_ws, src_row, clean_ws, dst_row)
+        ensure_equipment_merges(clean_ws, dst_row)
+        h_raw = source_rec.get("h_text", "")
+        n_raw = source_rec.get("n_text", "")
+
+    clean_ws.cell(dst_row, 8).value = _strip_copy_boilerplate(h_raw) or None
+    clean_ws.cell(dst_row, layout.col_repair).value = (
+        _strip_copy_boilerplate(n_raw) or None
+    )
+    for col in range(1, TABLE_COLS + 1):
+        val = clean_ws.cell(dst_row, col).value
+        if isinstance(val, CellRichText):
+            clean_ws.cell(dst_row, col).value = str(val)
+
+
+def build_diff_clean_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
+                           layout_data: list[dict], header_last: int,
+                           deleted: list[dict], log=print) -> None:
+    """Лист «Сравнение — копирование»: те же строки, plain text из сводника."""
+    if DIFF_CLEAN_SHEET_NAME in wb.sheetnames:
+        del wb[DIFF_CLEAN_SHEET_NAME]
+    clean_ws = wb.create_sheet(DIFF_CLEAN_SHEET_NAME)
+    copy_column_widths(svod_ws, clean_ws)
+    _copy_header_block(svod_ws, clean_ws, header_last)
+    dst_row = header_last + 1
+    _write_diff_clean_filter_note(clean_ws, dst_row)
+    dst_row += 1
+
+    if not layout_data and not deleted:
+        _write_diff_empty_note(clean_ws, dst_row)
+        _write_clean_sheet_legend(clean_ws)
+        log(f"  лист «{DIFF_CLEAN_SHEET_NAME}» (изменений нет)")
+        return
+
+    for item in layout_data:
+        if item["kind"] == "section":
+            _copy_data_row_with_merges(
+                svod_ws, clean_ws, item["src_row"], dst_row)
+            _apply_section_vertical_center(clean_ws, dst_row)
+            dst_row += 1
+        elif item["kind"] == "equipment":
+            _write_clean_equipment_row(
+                clean_ws, svod_ws, item["sv_row"], dst_row)
+            dst_row += 1
+
+    if deleted:
+        hdr = clean_ws.cell(dst_row, 1)
+        hdr.value = (
+            f"─── Удалено из исходных проектов ({len(deleted)} стр.) ───"
+        )
+        hdr.font = Font(name="Arial", size=10, bold=True)
+        hdr.alignment = Alignment(horizontal="center", vertical="center")
+        try:
+            clean_ws.merge_cells(f"A{dst_row}:{LAST_COL_LETTER}{dst_row}")
+        except Exception:
+            pass
+        dst_row += 1
+        for src in deleted:
+            _write_clean_equipment_row(
+                clean_ws, svod_ws, None, dst_row, source_rec=src)
+            dst_row += 1
+
+    _write_clean_sheet_legend(clean_ws)
+    log(f"  лист «{DIFF_CLEAN_SHEET_NAME}» создан")
+
+
 def _write_diff_empty_note(ws: Worksheet, row: int) -> None:
     cell = ws.cell(row, 1)
     cell.value = "Изменений относительно исходных проектов Коми/Арх РДУ не найдено."
@@ -2715,9 +2849,13 @@ def build_diff_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
             pair_by_row[sv["src_row"]] = (status, sv, src)
 
     changed_count = stats.modified + stats.new_in_svod
+    layout_data: list[dict] = []
+
     if changed_count == 0 and not deleted:
         _write_diff_empty_note(diff_ws, dst_row)
         _write_diff_legend(diff_ws)
+        build_diff_clean_sheet(
+            wb, svod_ws, layout_data, header_last, deleted, log=log)
         log(f"  изменений нет ({stats.same} строк без отличий)")
         return stats
 
@@ -2743,17 +2881,22 @@ def build_diff_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
                 _copy_data_row_with_merges(svod_ws, diff_ws, sec_r, dst_row)
                 _apply_section_vertical_center(diff_ws, dst_row)
                 copied_sections.add(sec_r)
+                layout_data.append({"kind": "section", "src_row": sec_r})
                 dst_row += 1
         pending_sections = []
 
         _copy_data_row_with_merges(svod_ws, diff_ws, src_row, dst_row)
+        _unmerge_equipment_row(diff_ws, dst_row)
         _annotate_equipment_row_diff(diff_ws, dst_row, sv, src, status)
+        layout_data.append({"kind": "equipment", "sv_row": src_row})
         dst_row += 1
 
     if deleted:
         _insert_deleted_source_rows(diff_ws, deleted, dst_row, None, log=log)
 
     _write_diff_legend(diff_ws)
+    build_diff_clean_sheet(
+        wb, svod_ws, layout_data, header_last, deleted, log=log)
     log(
         f"  на листе: {changed_count} изменённых/новых + "
         f"{stats.deleted_from_source} удалённых "
@@ -2797,6 +2940,7 @@ def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
         f"удалено из проектов: {stats.deleted_from_source}"
     )
     log(f"  лист «{DIFF_SHEET_NAME}» создан.")
+    log(f"  лист «{DIFF_CLEAN_SHEET_NAME}» — plain text для копирования.")
     _save_with_backup(wb, svod_path, log=log)
     return stats
 
