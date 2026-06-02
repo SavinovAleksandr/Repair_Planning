@@ -2496,8 +2496,6 @@ def _apply_safe_merged_diff(cell, old_t: str, new_t: str, *, wrap: bool = False)
     if _norm_match_key(old_t) == _norm_match_key(new_t):
         return
     base_font = cell.font
-    fname = base_font.name if base_font and base_font.name else "Arial"
-    fsize = base_font.size if base_font and base_font.size else 10.0
 
     def _wrap_cell() -> None:
         if wrap:
@@ -2510,8 +2508,11 @@ def _apply_safe_merged_diff(cell, old_t: str, new_t: str, *, wrap: bool = False)
             )
 
     def _plain_replace() -> None:
-        cell.value = f"− {old_t}\n+ {new_t}"
-        cell.font = Font(name=fname, size=fsize)
+        cell.value = CellRichText([
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), f"− {old_t}"),
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), f"\n+ {new_t}"),
+        ])
+        cell.font = _prepare_cell_font_for_rich(cell)
         cell.fill = PatternFill(
             start_color=DIFF_FILL_DATE_CHG,
             end_color=DIFF_FILL_DATE_CHG,
@@ -2656,7 +2657,7 @@ def _write_diff_legend(ws: Worksheet) -> None:
         "только изменённые строки;  "
         "зелёный — добавленный фрагмент;  "
         "красный — удалённый фрагмент;  "
-        "жёлтая заливка + «− / +» — сложная замена или даты E/F/G;  "
+        "жёлтая заливка — сложная замена (красный «−» / зелёный «+») или даты E/F/G;  "
         "даты E/F/G — «было → стало»;  "
         "зелёная строка — новая в своднике;  "
         "красная строка — удалена из проекта"
@@ -2712,6 +2713,8 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
             old_show = old_t or format_date_tuple(source.get(fld_d))
             new_show = new_t or format_date_tuple(svod.get(fld_d))
             _apply_date_cell_diff(cell, old_show, new_show)
+
+    ensure_equipment_merges(ws, row)
 
 
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
