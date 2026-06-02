@@ -29,6 +29,7 @@ Copyright (c) 2026 Савинов Александр, Сыктывкар. Все
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import shutil
 import sys
@@ -2470,106 +2471,117 @@ def _prepare_cell_font_for_rich(cell) -> Font:
     )
 
 
-def _unmerge_diff_rich_text_blocks(ws: Worksheet, row: int,
-                                   col_repair: int = 14) -> None:
-    """Снимает A:D / H:M / N:O — Excel ломает inlineStr внутри merge (sheet3.xml)."""
-    blocks = [(1, 4), (8, 13), (col_repair, col_repair + 1)]
-    for lo, hi in blocks:
-        for mr in list(ws.merged_cells.ranges):
-            if mr.min_row != row or mr.max_row != row:
-                continue
-            if mr.min_col == lo and mr.max_col == hi:
-                try:
-                    ws.unmerge_cells(str(mr))
-                except Exception:
-                    pass
+def _diff_block_style_key(block: TextBlock) -> tuple:
+    """Ключ стиля run'а для слияния соседних фрагментов одного типа."""
+    f = block.font
+    if f is None:
+        return (None, False)
+    color = getattr(f, "color", None)
+    if color is not None:
+        color = str(getattr(color, "rgb", None) or color)
+    return (color, bool(getattr(f, "strike", None)))
 
 
-def _apply_safe_merged_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Excel-safe diff в A/H/N: ≤2 rich-run (добавление/удаление хвоста) или plain «−/+».
+def _coalesce_diff_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
+    """Сливает соседние run'ы с одинаковым оформлением — меньше фрагментов для Excel."""
+    if not blocks:
+        return blocks
+    out: list[TextBlock] = [blocks[0]]
+    for block in blocks[1:]:
+        if _diff_block_style_key(block) == _diff_block_style_key(out[-1]):
+            prev = out[-1]
+            out[-1] = TextBlock(prev.font, f"{prev}{block}")
+        else:
+            out.append(block)
+    return out
 
-    Excel «восстанавливает» sheet3.xml при многофрагментном inlineStr
-    (SequenceMatcher + strike). Короткий suffix/prefix — 2 run'а; иначе plain.
-    """
+
+def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText | str:
+    """Rich text в стиле «Рецензирования»: зелёные вставки, красный зачёркнутый удалённый."""
+    old = old or ""
+    new = new or ""
+    if old == new:
+        return new
+    sm = difflib.SequenceMatcher(None, old, new)
+    blocks: list[TextBlock] = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            chunk = new[j1:j2]
+            if chunk:
+                blocks.append(TextBlock(_inline_font(base_font), chunk))
+        elif op == "delete":
+            chunk = old[i1:i2]
+            if chunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                    chunk,
+                ))
+        elif op == "insert":
+            chunk = new[j1:j2]
+            if chunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_ADD),
+                    chunk,
+                ))
+        elif op == "replace":
+            ochunk = old[i1:i2]
+            nchunk = new[j1:j2]
+            if ochunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                    ochunk,
+                ))
+            if nchunk:
+                blocks.append(TextBlock(
+                    _inline_font(base_font, color=DIFF_COLOR_ADD),
+                    nchunk,
+                ))
+    blocks = _coalesce_diff_blocks(blocks)
+    if not blocks:
+        return new
+    if len(blocks) == 1 and _diff_block_style_key(blocks[0]) == (None, False):
+        return str(blocks[0])
+    return CellRichText(blocks)
+
+
+def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
+    """Подсветка изменения текста в ячейке — посимвольный diff."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
     if _norm_match_key(old_t) == _norm_match_key(new_t):
         return
-    base_font = cell.font
-
-    def _wrap_cell() -> None:
-        if wrap:
-            al = cell.alignment
-            cell.alignment = Alignment(
-                horizontal=al.horizontal if al and al.horizontal else "left",
-                vertical="center",
-                wrap_text=True,
-                text_rotation=al.text_rotation if al else 0,
-            )
-
-    def _plain_replace() -> None:
-        cell.value = CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), f"− {old_t}"),
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), f"\n+ {new_t}"),
-        ])
+    rich = _text_diff_rich(old_t, new_t, cell.font)
+    cell.value = rich
+    if isinstance(rich, CellRichText):
         cell.font = _prepare_cell_font_for_rich(cell)
-        cell.fill = PatternFill(
-            start_color=DIFF_FILL_DATE_CHG,
-            end_color=DIFF_FILL_DATE_CHG,
-            fill_type="solid",
+    if wrap:
+        al = cell.alignment
+        cell.alignment = Alignment(
+            horizontal=al.horizontal if al and al.horizontal else "left",
+            vertical="center",
+            wrap_text=True,
+            text_rotation=al.text_rotation if al else 0,
         )
-        _wrap_cell()
-
-    def _set_rich(blocks: list) -> None:
-        cell.value = CellRichText(blocks)
-        cell.font = _prepare_cell_font_for_rich(cell)
-        _wrap_cell()
-
-    if not old_t.strip():
-        _set_rich([TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), new_t)])
-        return
-    if not new_t.strip():
-        _set_rich([TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), old_t)])
-        return
-
-    old_r = old_t.rstrip()
-    new_r = new_t.rstrip()
-    if new_r.startswith(old_r) and len(new_r) > len(old_r):
-        suffix = new_t[len(old_r):]
-        _set_rich([
-            TextBlock(_inline_font(base_font), new_t[: len(new_t) - len(suffix)]),
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), suffix),
-        ])
-        return
-    if old_r.startswith(new_r) and len(old_r) > len(new_r):
-        removed = old_t[len(new_r):]
-        _set_rich([
-            TextBlock(_inline_font(base_font), new_t),
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), removed),
-        ])
-        return
-
-    _plain_replace()
 
 
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
                         new_d: tuple | None, base_font: Font | None
                         ) -> CellRichText | str:
-    """Ячейка даты/числа: rich text «было → стало» (E/F/G не merged, ≤2 run)."""
+    """Ячейка даты/числа: diff «было → стало» с зачёркнутым старым и зелёным новым."""
     new_show = new_t or (format_date_tuple(new_d) if new_d else "")
     old_show = old_t or (format_date_tuple(old_d) if old_d else "")
     if _norm_match_key(old_show) == _norm_match_key(new_show):
         return new_show
     if not old_show:
-        return new_show
+        return _text_diff_rich("", new_show, base_font)
     if not new_show:
         return CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), old_show),
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                      old_show),
         ])
-    return CellRichText([
-        TextBlock(_inline_font(base_font), f"{old_show} → "),
-        TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), new_show),
-    ])
+    combined_old = f"{old_show} → "
+    combined_new = f"{old_show} → {new_show}"
+    return _text_diff_rich(combined_old, combined_new, base_font)
 
 
 def _apply_date_cell_diff(cell, old_show: str, new_show: str) -> None:
@@ -2655,10 +2667,10 @@ def _write_diff_legend(ws: Worksheet) -> None:
     legend = (
         "Легенда:  "
         "только изменённые строки;  "
-        "зелёный — добавленный фрагмент;  "
-        "красный — удалённый фрагмент;  "
-        "жёлтая заливка — сложная замена (красный «−» / зелёный «+») или даты E/F/G;  "
-        "даты E/F/G — «было → стало»;  "
+        "зелёный — добавленный текст;  "
+        "красный зачёркнутый — удалённый;  "
+        "жёлтая заливка — изменённые даты E/F/G;  "
+        "даты E/F/G — «было → стало» с diff;  "
         "зелёная строка — новая в своднике;  "
         "красная строка — удалена из проекта"
     )
@@ -2681,12 +2693,9 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # Rich text + merge → Excel «восстанавливает» sheet3.xml; снимаем объединение.
-    _unmerge_diff_rich_text_blocks(ws, row, layout.col_repair)
-
-    # A, H, N — Excel-safe diff (≤2 run или plain «−/+»).
+    # A, H, N — посимвольный diff (режим «Рецензирования» Word).
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
-        _apply_safe_merged_diff(
+        _apply_text_cell_diff(
             ws.cell(row, col),
             source.get(fld, ""),
             svod.get(fld, ""),
@@ -3022,7 +3031,7 @@ def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
 
     На листе сравнения — **только изменённые строки** (без неизменённых):
       • зелёный текст — добавленные символы;
-      • красный зачёркнутый — удалённый фрагмент / строка;
+      • красный зачёркнутый — удалённые символы (режим «Рецензирования»);
       • жёлтая заливка — изменённые даты начала/окончания.
     """
     root = root or ROOT
