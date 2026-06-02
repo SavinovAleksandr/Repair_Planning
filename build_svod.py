@@ -29,7 +29,6 @@ Copyright (c) 2026 Савинов Александр, Сыктывкар. Все
 from __future__ import annotations
 
 import argparse
-import difflib
 import re
 import shutil
 import sys
@@ -2458,51 +2457,6 @@ def _inline_font(base: Font | None, *, color: str | None = None,
     if bold:
         kw["b"] = True
     return InlineFont(**kw)
-
-
-def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText | str:
-    """Rich text: зелёные вставки, красный зачёркнутый удалённый фрагмент."""
-    old = old or ""
-    new = new or ""
-    if old == new:
-        return new
-    sm = difflib.SequenceMatcher(None, old, new)
-    blocks: list[TextBlock] = []
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == "equal":
-            chunk = new[j1:j2]
-            if chunk:
-                blocks.append(TextBlock(_inline_font(base_font), chunk))
-        elif op == "delete":
-            chunk = old[i1:i2]
-            if chunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                    chunk,
-                ))
-        elif op == "insert":
-            chunk = new[j1:j2]
-            if chunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_ADD),
-                    chunk,
-                ))
-        elif op == "replace":
-            ochunk = old[i1:i2]
-            nchunk = new[j1:j2]
-            if ochunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                    ochunk,
-                ))
-            if nchunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_ADD),
-                    nchunk,
-                ))
-    if not blocks:
-        return new
-    return CellRichText(blocks)
 
 
 def _prepare_cell_font_for_rich(cell) -> Font:
