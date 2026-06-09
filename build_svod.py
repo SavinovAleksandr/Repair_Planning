@@ -148,9 +148,7 @@ DIFF_FILL_DELETED_ROW = "FFC7CE"   # светло-красная заливка 
 DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые строки в своднике
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
-DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
-DIFF_FALLBACK_RATIO = 0.55         # ниже — целиком «было / стало», не посимвольно
-DIFF_MAX_RICH_RUNS = 8             # лимит run'ов: Excel ломает sheet3.xml при переполнении
+DIFF_COLOR_DEL = "FF0000"          # красный текст (удаления / «−»)
 
 # Фразы, убираемые на листе «вставить в ПК Ремонты» (время/тип ремонта могут отличаться).
 _AG_KINDS = r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР|РЕК)"
@@ -2290,16 +2288,6 @@ def _texts_meaningfully_differ(old: str, new: str) -> bool:
     return True
 
 
-def _visible_diff_chunk(chunk: str) -> str:
-    """Делает пробелы/переносы в diff-фрагменте видимыми в Excel (только ASCII)."""
-    if not chunk or chunk.strip() != "":
-        return chunk
-    return (chunk
-            .replace("\n", "\\n")
-            .replace("\t", "\\t")
-            .replace(" ", "."))
-
-
 def _record_group(rec: dict) -> str:
     g = rec.get("group")
     if g:
@@ -2590,10 +2578,19 @@ def _set_cell_rich_diff(cell, rich: CellRichText | str, *, wrap: bool = False) -
         )
 
 
+def _plain_colored_replace(old_t: str, new_t: str,
+                           base_font: Font | None) -> CellRichText:
+    """Сложные замены: 2 run'а «− было» / «+ стало» (без strike — Excel-safe)."""
+    return CellRichText([
+        TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), f"− {old_t}"),
+        TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), f"\n+ {new_t}"),
+    ])
+
+
 def _try_prefix_suffix_diff(cell, old_t: str, new_t: str,
                             base_font: Font | None, *, wrap: bool = False
                             ) -> bool:
-    """Excel-safe diff: не более 2 run'ов при изменении только начала/конца."""
+    """Excel-safe diff: ≤2 run'а при изменении только начала/конца текста."""
     old_r = old_t.rstrip()
     new_r = new_t.rstrip()
     if new_r.startswith(old_r) and len(new_r) > len(old_r):
@@ -2607,140 +2604,58 @@ def _try_prefix_suffix_diff(cell, old_t: str, new_t: str,
         removed = old_t[len(new_r):]
         _set_cell_rich_diff(cell, CellRichText([
             TextBlock(_inline_font(base_font), new_t),
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                      removed),
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), removed),
         ]), wrap=wrap)
         return True
     return False
 
 
-def _text_diff_whole_replace(old: str, new: str,
-                             base_font: Font | None) -> CellRichText:
-    """Сильно различающиеся тексты: зачёркнутое «было», с новой строки «стало»."""
-    blocks: list[TextBlock] = []
-    if old:
-        blocks.append(TextBlock(
-            _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True), old))
-    if old and new:
-        blocks.append(TextBlock(_inline_font(base_font), "\n"))
-    if new:
-        blocks.append(TextBlock(
-            _inline_font(base_font, color=DIFF_COLOR_ADD), new))
-    return CellRichText(_coalesce_diff_blocks(blocks))
-
-
-def _diff_block_style_key(block: TextBlock) -> tuple:
-    """Ключ стиля run'а для слияния соседних фрагментов одного типа."""
-    f = block.font
-    if f is None:
-        return (None, False)
-    color = getattr(f, "color", None)
-    if color is not None:
-        color = str(getattr(color, "rgb", None) or color)
-    return (color, bool(getattr(f, "strike", None)))
-
-
-def _coalesce_diff_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
-    """Сливает соседние run'ы с одинаковым оформлением — меньше фрагментов для Excel."""
-    if not blocks:
-        return blocks
-    out: list[TextBlock] = [blocks[0]]
-    for block in blocks[1:]:
-        if _diff_block_style_key(block) == _diff_block_style_key(out[-1]):
-            prev = out[-1]
-            out[-1] = TextBlock(prev.font, f"{prev}{block}")
-        else:
-            out.append(block)
-    return out
-
-
-def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText | str:
-    """Rich text «Рецензирования»: посимвольный diff; при сильных отличиях — «было/стало»."""
-    old = old or ""
-    new = new or ""
-    if old == new:
-        return new
-    ratio = difflib.SequenceMatcher(None, old, new).ratio()
-    if ratio < DIFF_FALLBACK_RATIO:
-        return _text_diff_whole_replace(old, new, base_font)
-
-    sm = difflib.SequenceMatcher(None, old, new)
-    blocks: list[TextBlock] = []
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == "equal":
-            chunk = new[j1:j2]
-            if chunk:
-                blocks.append(TextBlock(_inline_font(base_font), chunk))
-        elif op == "delete":
-            chunk = old[i1:i2]
-            if chunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                    _visible_diff_chunk(chunk),
-                ))
-        elif op == "insert":
-            chunk = new[j1:j2]
-            if chunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_ADD),
-                    _visible_diff_chunk(chunk),
-                ))
-        elif op == "replace":
-            ochunk = old[i1:i2]
-            nchunk = new[j1:j2]
-            if ochunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                    _visible_diff_chunk(ochunk),
-                ))
-            if nchunk:
-                blocks.append(TextBlock(
-                    _inline_font(base_font, color=DIFF_COLOR_ADD),
-                    _visible_diff_chunk(nchunk),
-                ))
-    blocks = _coalesce_diff_blocks(blocks)
-    if len(blocks) > DIFF_MAX_RICH_RUNS:
-        return _text_diff_whole_replace(old, new, base_font)
-    if not blocks:
-        return new
-    if len(blocks) == 1 and _diff_block_style_key(blocks[0]) == (None, False):
-        return str(blocks[0])
-    return CellRichText(blocks)
-
-
 def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Подсветка изменения текста в ячейке — посимвольный diff (Excel-safe)."""
+    """Подсветка изменения в A/H/N: ≤2 rich-run или «−/+» — без strike (Excel-safe)."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
     if not _texts_meaningfully_differ(old_t, new_t):
         return
     base_font = cell.font
+    if not old_t.strip():
+        _set_cell_rich_diff(cell, CellRichText([
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), new_t),
+        ]), wrap=wrap)
+        return
+    if not new_t.strip():
+        _set_cell_rich_diff(cell, CellRichText([
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), old_t),
+        ]), wrap=wrap)
+        return
     if _try_prefix_suffix_diff(cell, old_t, new_t, base_font, wrap=wrap):
         return
-    rich = _text_diff_rich(old_t, new_t, base_font)
-    if isinstance(rich, CellRichText) and len(rich) > DIFF_MAX_RICH_RUNS:
-        rich = _text_diff_whole_replace(old_t, new_t, base_font)
-    _set_cell_rich_diff(cell, rich, wrap=wrap)
+    _set_cell_rich_diff(
+        cell, _plain_colored_replace(old_t, new_t, base_font), wrap=wrap)
+    cell.fill = PatternFill(
+        start_color=DIFF_FILL_DATE_CHG,
+        end_color=DIFF_FILL_DATE_CHG,
+        fill_type="solid",
+    )
 
 
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
                         new_d: tuple | None, base_font: Font | None
                         ) -> CellRichText | str:
-    """Ячейка даты/числа: diff «было → стало» с зачёркнутым старым и зелёным новым."""
+    """Ячейка даты/числа: «было → стало» в 2 run'ах (Excel-safe)."""
     new_show = new_t or (format_date_tuple(new_d) if new_d else "")
     old_show = old_t or (format_date_tuple(old_d) if old_d else "")
     if not _texts_meaningfully_differ(old_show, new_show):
         return new_show
     if not old_show:
-        return _text_diff_rich("", new_show, base_font)
+        return new_show
     if not new_show:
         return CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                      old_show),
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), old_show),
         ])
-    combined_old = f"{old_show} → "
-    combined_new = f"{old_show} → {new_show}"
-    return _text_diff_rich(combined_old, combined_new, base_font)
+    return CellRichText([
+        TextBlock(_inline_font(base_font), f"{old_show} → "),
+        TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), new_show),
+    ])
 
 
 def _apply_date_cell_diff(cell, old_show: str, new_show: str) -> None:
@@ -2827,10 +2742,9 @@ def _write_diff_legend(ws: Worksheet) -> None:
         "Легенда:  "
         "только изменённые строки;  "
         "зелёный — добавленный текст;  "
-        "красный зачёркнутый — удалённый;  "
-        "точка в diff — видимый пробел;  "
-        "N:O без merge, если есть подсветка;  "
-        "при полной замене текста — блок «было» / «стало»;  "
+        "красный — удалённый / строка «−»;  "
+        "сложная замена — красный «−» и зелёный «+» (жёлтая заливка);  "
+        "N:O без merge при подсветке;  "
         "жёлтая заливка — изменённые даты E/F/G;  "
         "даты E/F/G — «было → стало» с diff;  "
         "зелёная строка — новая в своднике;  "
