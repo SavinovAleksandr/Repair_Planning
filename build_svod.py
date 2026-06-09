@@ -150,7 +150,7 @@ DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые да�
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
 DIFF_FALLBACK_RATIO = 0.55         # ниже — целиком «было / стало», не посимвольно
-DIFF_MAX_RICH_RUNS = 48            # лимит run'ов: Excel ломает sheet3.xml при переполнении
+DIFF_MAX_RICH_RUNS = 8             # лимит run'ов: Excel ломает sheet3.xml при переполнении
 
 # Фразы, убираемые на листе «вставить в ПК Ремонты» (время/тип ремонта могут отличаться).
 _AG_KINDS = r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР|РЕК)"
@@ -1240,12 +1240,17 @@ def _sum_col_width(ws: Worksheet, lo: int, hi: int,
 
 
 def ensure_equipment_merges(ws: Worksheet, row: int,
-                            merges: list[tuple[int, int]] = EQUIPMENT_MERGES
+                            merges: list[tuple[int, int]] = EQUIPMENT_MERGES,
+                            *, skip_rich_cols: bool = False,
                             ) -> None:
     """Гарантирует, что в строке оборудования есть стандартные объединения
     A:D / H:M / N:O / X:Y. Если какой-то merge отсутствует — создаётся;
     если в диапазон «влез» меньший merge из источника — он снимается и
-    переопределяется полностью."""
+    переопределяется полностью.
+
+    skip_rich_cols: не объединять блок, если в левой ячейке CellRichText —
+    иначе Excel на Windows «восстанавливает» sheet3.xml (inlineStr в merge).
+    """
     # Существующие одностроковые объединения в этой строке.
     existing: list[tuple[int, int]] = [
         (mr.min_col, mr.max_col)
@@ -1253,6 +1258,8 @@ def ensure_equipment_merges(ws: Worksheet, row: int,
         if mr.min_row == row and mr.max_row == row
     ]
     for lo, hi in merges:
+        if skip_rich_cols and isinstance(ws.cell(row, lo).value, CellRichText):
+            continue
         if (lo, hi) in existing:
             continue
         # Снимаем частично пересекающиеся объединения внутри диапазона.
@@ -2265,6 +2272,34 @@ def _norm_match_key(text: str) -> str:
     return s
 
 
+def _collapse_ws(text: str) -> str:
+    """Текст без любых пробельных символов — для отсечения чисто пробельных diff."""
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _texts_meaningfully_differ(old: str, new: str) -> bool:
+    """True, если тексты различаются не только пробелами/переносами."""
+    old = str(old or "")
+    new = str(new or "")
+    if old == new:
+        return False
+    if _norm_match_key(old) == _norm_match_key(new):
+        return False
+    if _collapse_ws(old) == _collapse_ws(new):
+        return False
+    return True
+
+
+def _visible_diff_chunk(chunk: str) -> str:
+    """Делает пробелы/переносы в diff-фрагменте видимыми в Excel (только ASCII)."""
+    if not chunk or chunk.strip() != "":
+        return chunk
+    return (chunk
+            .replace("\n", "\\n")
+            .replace("\t", "\\t")
+            .replace(" ", "."))
+
+
 def _record_group(rec: dict) -> str:
     g = rec.get("group")
     if g:
@@ -2378,14 +2413,14 @@ def _record_fields_differ(svod: dict, source: dict) -> bool:
         return True
     src_h, src_n = _align_source_hn_for_diff(
         source.get("h_text", ""), source.get("n_text", ""))
-    if _norm_match_key(svod.get("h_text", "")) != _norm_match_key(src_h):
+    if _texts_meaningfully_differ(src_h, svod.get("h_text", "")):
         return True
-    if _norm_match_key(svod.get("n_text", "")) != _norm_match_key(src_n):
+    if _texts_meaningfully_differ(src_n, svod.get("n_text", "")):
         return True
-    if _norm_match_key(svod.get("days_text", "")) != _norm_match_key(
-            source.get("days_text", "")):
+    if _texts_meaningfully_differ(
+            source.get("days_text", ""), svod.get("days_text", "")):
         return True
-    if _norm_match_key(svod.get("name", "")) != _norm_match_key(source.get("name", "")):
+    if _texts_meaningfully_differ(source.get("name", ""), svod.get("name", "")):
         return True
     return False
 
@@ -2540,6 +2575,45 @@ def _unmerge_diff_rich_text_blocks(ws: Worksheet, row: int,
                     pass
 
 
+def _set_cell_rich_diff(cell, rich: CellRichText | str, *, wrap: bool = False) -> None:
+    """Записывает rich text в ячейку и сбрасывает цвет базового шрифта."""
+    cell.value = rich
+    if isinstance(rich, CellRichText):
+        cell.font = _prepare_cell_font_for_rich(cell)
+    if wrap:
+        al = cell.alignment
+        cell.alignment = Alignment(
+            horizontal=al.horizontal if al and al.horizontal else "left",
+            vertical="center",
+            wrap_text=True,
+            text_rotation=al.text_rotation if al else 0,
+        )
+
+
+def _try_prefix_suffix_diff(cell, old_t: str, new_t: str,
+                            base_font: Font | None, *, wrap: bool = False
+                            ) -> bool:
+    """Excel-safe diff: не более 2 run'ов при изменении только начала/конца."""
+    old_r = old_t.rstrip()
+    new_r = new_t.rstrip()
+    if new_r.startswith(old_r) and len(new_r) > len(old_r):
+        suffix = new_t[len(old_r):]
+        _set_cell_rich_diff(cell, CellRichText([
+            TextBlock(_inline_font(base_font), new_t[: len(new_t) - len(suffix)]),
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), suffix),
+        ]), wrap=wrap)
+        return True
+    if old_r.startswith(new_r) and len(old_r) > len(new_r):
+        removed = old_t[len(new_r):]
+        _set_cell_rich_diff(cell, CellRichText([
+            TextBlock(_inline_font(base_font), new_t),
+            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
+                      removed),
+        ]), wrap=wrap)
+        return True
+    return False
+
+
 def _text_diff_whole_replace(old: str, new: str,
                              base_font: Font | None) -> CellRichText:
     """Сильно различающиеся тексты: зачёркнутое «было», с новой строки «стало»."""
@@ -2602,14 +2676,14 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
             if chunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                    chunk,
+                    _visible_diff_chunk(chunk),
                 ))
         elif op == "insert":
             chunk = new[j1:j2]
             if chunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_ADD),
-                    chunk,
+                    _visible_diff_chunk(chunk),
                 ))
         elif op == "replace":
             ochunk = old[i1:i2]
@@ -2617,12 +2691,12 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
             if ochunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
-                    ochunk,
+                    _visible_diff_chunk(ochunk),
                 ))
             if nchunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_ADD),
-                    nchunk,
+                    _visible_diff_chunk(nchunk),
                 ))
     blocks = _coalesce_diff_blocks(blocks)
     if len(blocks) > DIFF_MAX_RICH_RUNS:
@@ -2635,23 +2709,18 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
 
 
 def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Подсветка изменения текста в ячейке — посимвольный diff."""
+    """Подсветка изменения текста в ячейке — посимвольный diff (Excel-safe)."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
-    if _norm_match_key(old_t) == _norm_match_key(new_t):
+    if not _texts_meaningfully_differ(old_t, new_t):
         return
-    rich = _text_diff_rich(old_t, new_t, cell.font)
-    cell.value = rich
-    if isinstance(rich, CellRichText):
-        cell.font = _prepare_cell_font_for_rich(cell)
-    if wrap:
-        al = cell.alignment
-        cell.alignment = Alignment(
-            horizontal=al.horizontal if al and al.horizontal else "left",
-            vertical="center",
-            wrap_text=True,
-            text_rotation=al.text_rotation if al else 0,
-        )
+    base_font = cell.font
+    if _try_prefix_suffix_diff(cell, old_t, new_t, base_font, wrap=wrap):
+        return
+    rich = _text_diff_rich(old_t, new_t, base_font)
+    if isinstance(rich, CellRichText) and len(rich) > DIFF_MAX_RICH_RUNS:
+        rich = _text_diff_whole_replace(old_t, new_t, base_font)
+    _set_cell_rich_diff(cell, rich, wrap=wrap)
 
 
 def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
@@ -2660,7 +2729,7 @@ def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
     """Ячейка даты/числа: diff «было → стало» с зачёркнутым старым и зелёным новым."""
     new_show = new_t or (format_date_tuple(new_d) if new_d else "")
     old_show = old_t or (format_date_tuple(old_d) if old_d else "")
-    if _norm_match_key(old_show) == _norm_match_key(new_show):
+    if not _texts_meaningfully_differ(old_show, new_show):
         return new_show
     if not old_show:
         return _text_diff_rich("", new_show, base_font)
@@ -2678,7 +2747,7 @@ def _apply_date_cell_diff(cell, old_show: str, new_show: str) -> None:
     """Подсветка изменения в E/F/G: rich text и жёлтая заливка."""
     old_show = str(old_show or "").strip()
     new_show = str(new_show or "").strip()
-    if _norm_match_key(old_show) == _norm_match_key(new_show):
+    if not _texts_meaningfully_differ(old_show, new_show):
         return
     cell.value = _format_date_change(
         old_show, new_show, None, None, cell.font)
@@ -2759,6 +2828,8 @@ def _write_diff_legend(ws: Worksheet) -> None:
         "только изменённые строки;  "
         "зелёный — добавленный текст;  "
         "красный зачёркнутый — удалённый;  "
+        "точка в diff — видимый пробел;  "
+        "N:O без merge, если есть подсветка;  "
         "при полной замене текста — блок «было» / «стало»;  "
         "жёлтая заливка — изменённые даты E/F/G;  "
         "даты E/F/G — «было → стало» с diff;  "
@@ -2816,12 +2887,12 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
         old_t = source.get(fld_t, "")
         new_t = svod.get(fld_t, "")
         if (not _dates_equal(svod.get(fld_d), source.get(fld_d))
-                or _norm_match_key(old_t) != _norm_match_key(new_t)):
+                or _texts_meaningfully_differ(old_t, new_t)):
             old_show = old_t or format_date_tuple(source.get(fld_d))
             new_show = new_t or format_date_tuple(svod.get(fld_d))
             _apply_date_cell_diff(cell, old_show, new_show)
 
-    ensure_equipment_merges(ws, row)
+    ensure_equipment_merges(ws, row, skip_rich_cols=True)
 
 
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
