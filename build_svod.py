@@ -2545,7 +2545,8 @@ def _pop_best_source(candidates: list[dict], sv: dict) -> dict:
 
 
 def _inline_font(base: Font | None, *, color: str | None = None,
-                 strike: bool = False, bold: bool = False) -> InlineFont:
+                 strike: bool = False, underline: bool = False,
+                 bold: bool = False) -> InlineFont:
     """InlineFont для rich text с наследованием размера/имени из ячейки."""
     name = (base.name if base and base.name else "Arial")
     size = base.size if base and base.size else 10.0
@@ -2554,6 +2555,8 @@ def _inline_font(base: Font | None, *, color: str | None = None,
         kw["color"] = f"00{color}" if len(color) == 6 else color
     if strike:
         kw["strike"] = True
+    if underline:
+        kw["u"] = "single"
     if bold:
         kw["b"] = True
     return InlineFont(**kw)
@@ -2600,59 +2603,62 @@ def _set_cell_rich_diff(cell, rich: CellRichText | str, *, wrap: bool = False) -
         )
 
 
-def _plain_colored_replace(old_t: str, new_t: str,
-                           base_font: Font | None) -> CellRichText:
-    """Сложные замены: 2 run'а «− было» / «+ стало» (без strike — Excel-safe)."""
-    return CellRichText([
-        TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), f"− {old_t}"),
-        TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), f"\n+ {new_t}"),
-    ])
+def _append_rich_run(runs: list[TextBlock], font: InlineFont, text: str) -> None:
+    """Добавляет rich-run, склеивая соседние блоки с тем же форматированием."""
+    if not text:
+        return
+    # openpyxl не даёт удобно сравнить InlineFont, поэтому сравниваем XML-представление.
+    font_key = font.to_tree().attrib, tuple((c.tag, c.attrib, c.text) for c in font.to_tree())
+    if runs:
+        last_font = runs[-1].font
+        last_key = last_font.to_tree().attrib, tuple((c.tag, c.attrib, c.text) for c in last_font.to_tree())
+        if last_key == font_key:
+            runs[-1].text += text
+            return
+    runs.append(TextBlock(font, text))
 
 
-def _try_prefix_suffix_diff(cell, old_t: str, new_t: str,
-                            base_font: Font | None, *, wrap: bool = False
-                            ) -> bool:
-    """Excel-safe diff: ≤2 run'а при изменении только начала/конца текста."""
-    old_r = old_t.rstrip()
-    new_r = new_t.rstrip()
-    if new_r.startswith(old_r) and len(new_r) > len(old_r):
-        suffix = new_t[len(old_r):]
-        _set_cell_rich_diff(cell, CellRichText([
-            TextBlock(_inline_font(base_font), new_t[: len(new_t) - len(suffix)]),
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), suffix),
-        ]), wrap=wrap)
-        return True
-    if old_r.startswith(new_r) and len(old_r) > len(new_r):
-        removed = old_t[len(new_r):]
-        _set_cell_rich_diff(cell, CellRichText([
-            TextBlock(_inline_font(base_font), new_t),
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), removed),
-        ]), wrap=wrap)
-        return True
-    return False
+def _build_char_level_rich_diff(old_t: str, new_t: str,
+                                base_font: Font | None) -> CellRichText:
+    """
+    Посимвольный diff для Excel:
+    - неизменённый текст остаётся обычным;
+    - удалённые символы из исходного текста — красные и зачёркнутые;
+    - добавленные символы — зелёные без зачёркиваний и подчёркиваний.
+
+    Важно для Windows Excel: rich text записывается только в левую верхнюю
+    ячейку объединённого диапазона, merge при этом сохраняется.
+    """
+    base = _inline_font(base_font)
+    deleted = _inline_font(
+        base_font, color=DIFF_COLOR_DEL, strike=True)
+    added = _inline_font(base_font, color=DIFF_COLOR_ADD)
+
+    runs: list[TextBlock] = []
+    sm = difflib.SequenceMatcher(None, old_t, new_t, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            _append_rich_run(runs, base, old_t[i1:i2])
+        elif tag == "delete":
+            _append_rich_run(runs, deleted, old_t[i1:i2])
+        elif tag == "insert":
+            _append_rich_run(runs, added, new_t[j1:j2])
+        elif tag == "replace":
+            _append_rich_run(runs, deleted, old_t[i1:i2])
+            _append_rich_run(runs, added, new_t[j1:j2])
+
+    return CellRichText(runs)
 
 
 def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Подсветка изменения в A/H/N: ≤2 rich-run или «−/+» — без strike (Excel-safe)."""
+    """Посимвольная подсветка изменения в A/H/N без формата «− было / + стало»."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
     if not _texts_meaningfully_differ(old_t, new_t):
         return
     base_font = cell.font
-    if not old_t.strip():
-        _set_cell_rich_diff(cell, CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), new_t),
-        ]), wrap=wrap)
-        return
-    if not new_t.strip():
-        _set_cell_rich_diff(cell, CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), old_t),
-        ]), wrap=wrap)
-        return
-    if _try_prefix_suffix_diff(cell, old_t, new_t, base_font, wrap=wrap):
-        return
-    _set_cell_rich_diff(
-        cell, _plain_colored_replace(old_t, new_t, base_font), wrap=wrap)
+    rich = _build_char_level_rich_diff(old_t, new_t, base_font)
+    _set_cell_rich_diff(cell, rich, wrap=wrap)
     cell.fill = PatternFill(
         start_color=DIFF_FILL_DATE_CHG,
         end_color=DIFF_FILL_DATE_CHG,
