@@ -244,6 +244,72 @@ def parse_day_month(value, default_year: int) -> tuple[int, int, int] | None:
     return (year, mon, day)
 
 
+def inclusive_calendar_days(start: tuple[int, int, int] | None,
+                            end: tuple[int, int, int] | None) -> int | None:
+    """Включительное число календарных дней между датами (как в столбце E)."""
+    if start is None or end is None:
+        return None
+    d0 = datetime(start[0], start[1], start[2])
+    d1 = datetime(end[0], end[1], end[2])
+    if d1 < d0:
+        return None
+    return (d1 - d0).days + 1
+
+
+def _parse_days_cell(value) -> int | None:
+    """Разбирает значение ячейки «количество дней» (столбец E)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d+)", s)
+    return int(m.group(1)) if m else None
+
+
+def _sync_days_cell_from_dates(
+        ws: Worksheet, row: int, layout: ProjectLayout, default_year: int,
+        start: tuple[int, int, int] | None = None,
+        end: tuple[int, int, int] | None = None) -> bool:
+    """Сверяет E с F/G и при расхождении записывает корректное значение."""
+    if start is None:
+        start = parse_day_month(
+            _cell_text_with_merges(ws, row, layout.col_start), default_year)
+    if end is None:
+        end = parse_day_month(
+            _cell_text_with_merges(ws, row, layout.col_end), default_year)
+    expected = inclusive_calendar_days(start, end)
+    if expected is None:
+        return False
+    cell = ws.cell(row, layout.col_days)
+    if _parse_days_cell(cell.value) == expected:
+        return False
+    cell.value = expected
+    return True
+
+
+def fix_equipment_days_inplace(ws: Worksheet, svod_path: Path,
+                               default_year: int | None = None,
+                               log=print) -> int:
+    """Проверяет столбец E во всех строках оборудования на Page1."""
+    header_last, data_last, _ = find_data_bounds(ws)
+    layout = detect_project_layout(ws)
+    year = default_year_for_svod(svod_path, default_year)
+    fixed = 0
+    for r in range(header_last + 1, data_last + 1):
+        if is_toc_row(ws, r) or is_section_row(ws, r):
+            continue
+        if not is_equipment_row(ws, r):
+            continue
+        if _sync_days_cell_from_dates(ws, r, layout, year):
+            name = str(ws.cell(r, 1).value or "")[:48]
+            log(f"  E: строка {r} «{name}» → {ws.cell(r, layout.col_days).value}")
+            fixed += 1
+    return fixed
+
+
 def _cell_text_with_merges(ws: Worksheet, row: int, col: int) -> str:
     """Возвращает текст ячейки; если ячейка внутри объединения и сама пустая —
     вернёт текст «владельца» объединения (top-left-ячейки)."""
@@ -1377,6 +1443,15 @@ def write_equipment_row(out_ws: Worksheet, dst_row: int, rec: dict,
     if new_n != (n_cell.value or ""):
         n_cell.value = new_n if new_n else None
 
+    layout = rec.get("layout")
+    if not isinstance(layout, ProjectLayout):
+        layout = detect_project_layout(out_ws)
+    expected_days = inclusive_calendar_days(rec.get("start"), rec.get("end"))
+    if expected_days is not None:
+        days_cell = out_ws.cell(dst_row, layout.col_days)
+        if _parse_days_cell(days_cell.value) != expected_days:
+            days_cell.value = expected_days
+
     # Гарантируем перенос текста в H и N (для корректного отображения
     # многострочных описаний).
     for cell in (h_cell, n_cell):
@@ -2101,7 +2176,30 @@ def stage_set_heights_inplace(svod_path: Path, log=print) -> None:
         except Exception:
             pass
 
+    fixed_days = fix_equipment_days_inplace(ws, svod_path, log=log)
+    if fixed_days:
+        log(f"  проверка E: исправлено {fixed_days} строк")
+    else:
+        log("  проверка E: расхождений нет")
+
     _save_with_backup(wb, svod_path, log=log)
+
+
+def stage_fix_days_inplace(svod_path: Path, default_year: int | None = None,
+                           log=print) -> int:
+    """Проверяет и при необходимости исправляет столбец E по датам F/G."""
+    log(f"Проверка количества дней (столбец E): {svod_path.name}")
+    wb = openpyxl.load_workbook(svod_path)
+    if "Page1" not in wb.sheetnames:
+        raise RuntimeError("В файле нет листа «Page1».")
+    ws = wb["Page1"]
+    fixed = fix_equipment_days_inplace(ws, svod_path, default_year, log=log)
+    if fixed:
+        log(f"  исправлено строк: {fixed}")
+        _save_with_backup(wb, svod_path, log=log)
+    else:
+        log("  расхождений нет")
+    return fixed
 
 
 def stage_build_gantt_inplace(svod_path: Path, default_year: int | None = None,
@@ -2118,6 +2216,9 @@ def stage_build_gantt_inplace(svod_path: Path, default_year: int | None = None,
     ws = wb["Page1"]
 
     parse_year = default_year_for_svod(svod_path, default_year)
+    fixed_days = fix_equipment_days_inplace(ws, svod_path, parse_year, log=log)
+    if fixed_days:
+        log(f"  проверка E: исправлено {fixed_days} строк")
     fn_month, fn_year = infer_schedule_from_filename(svod_path)
     recs = extract_records_from_svod(ws, default_year=parse_year)
     if not recs:
@@ -3318,6 +3419,9 @@ def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
     if "Page1" not in wb.sheetnames:
         raise RuntimeError("В файле нет листа «Page1».")
     ws = wb["Page1"]
+    fixed_days = fix_equipment_days_inplace(ws, svod_path, parse_year, log=log)
+    if fixed_days:
+        log(f"  проверка E: исправлено {fixed_days} строк")
     svod_recs = extract_records_from_svod(
         ws, default_year=parse_year, section_rdu_map=section_rdu_map)
 
@@ -3380,6 +3484,7 @@ STAGE_CHOICES = (
     "toc",         # только перегенерация оглавления
     "heights",     # только фиксация высот и wrap_text
     "gantt",       # только перестроить лист «Диаграмма»
+    "days",        # проверка/исправление столбца E по датам F/G
     "diff",        # лист «Сравнение с проектами» vs исходные Коми/Арх
     "restore",     # откатить сводник к последней резервной копии
 )
@@ -3478,6 +3583,10 @@ def main():
         elif args.stage == "gantt":
             svod = _require_existing_svod()
             stage_build_gantt_inplace(svod, args.year, log=print)
+
+        elif args.stage == "days":
+            svod = _require_existing_svod()
+            stage_fix_days_inplace(svod, args.year, log=print)
 
         elif args.stage == "diff":
             svod = _require_existing_svod()
