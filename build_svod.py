@@ -33,6 +33,7 @@ import difflib
 import re
 import shutil
 import sys
+import unicodedata
 from collections import Counter, defaultdict, OrderedDict
 from copy import copy as _copy
 from dataclasses import dataclass, field
@@ -189,12 +190,27 @@ class ProjectLayout:
 
 # ------------------------------------------------------------------ УТИЛИТЫ --
 
+def _nfc(text: str) -> str:
+    """Unicode NFC: помогает одинаково находить файлы после распаковки с macOS."""
+    return unicodedata.normalize("NFC", str(text or ""))
+
+
 def find_file(name: str) -> Path:
-    """Ищет файл в корне, затем в 'Исходные материалы'. Возвращает Path или None."""
+    """Ищет файл в корне, затем в 'Исходные материалы'. Возвращает Path или None.
+
+    При распаковке архива с macOS русские имена файлов часто попадают в NFD
+    (например, «Сводный» вместо «Сводный»). Поэтому сначала проверяем
+    точное имя, затем сравниваем имена в NFC.
+    """
+    wanted = _nfc(name)
     for base in (ROOT, FALLBACK_DIR):
         p = base / name
         if p.exists():
             return p
+        if base.exists():
+            for cand in base.iterdir():
+                if cand.is_file() and _nfc(cand.name) == wanted:
+                    return cand
     return None
 
 
@@ -1804,10 +1820,16 @@ def build_output(priority: dict, records: list[dict],
 
 def find_existing_svod(root: Path) -> Path | None:
     """Возвращает путь к последнему (по mtime) файлу «Сводный график …xlsx»
-    в корне проекта. None — если файла нет."""
+    в корне проекта. None — если файла нет.
+
+    Сравнение префикса выполняется в Unicode NFC, чтобы файл находился после
+    распаковки архива, созданного на macOS.
+    """
+    prefix = _nfc(SVOD_FILE_PREFIX)
     candidates = [
-        p for p in root.glob(f"{SVOD_FILE_PREFIX}*.xlsx")
-        if not p.name.startswith("~$")  # временный lock-файл Excel
+        p for p in root.glob("*.xlsx")
+        if not p.name.startswith("~$")
+        and _nfc(p.name).startswith(prefix)
     ]
     if not candidates:
         return None
@@ -2744,7 +2766,7 @@ def _write_diff_legend(ws: Worksheet) -> None:
         "зелёный — добавленный текст;  "
         "красный — удалённый / строка «−»;  "
         "сложная замена — красный «−» и зелёный «+» (жёлтая заливка);  "
-        "N:O без merge при подсветке;  "
+        "объединения A:D / H:M / N:O / X:Y сохранены;  "
         "жёлтая заливка — изменённые даты E/F/G;  "
         "даты E/F/G — «было → стало» с diff;  "
         "зелёная строка — новая в своднике;  "
@@ -2769,8 +2791,10 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # A, H, N — посимвольный diff (режим «Рецензирования»); перед rich text снимаем merge.
-    _unmerge_diff_rich_text_blocks(ws, row, layout.col_repair)
+    # A, H, N — текстовый diff внутри штатных объединённых ячеек.
+    # Раньше здесь снимались merge A:D / H:M / N:O, из-за чего лист сравнения
+    # терял структуру ПК «Ремонты». Теперь rich text пишется в левую верхнюю
+    # ячейку объединённого диапазона, а merge сохраняется.
     src_h, src_n = _align_source_hn_for_diff(
         source.get("h_text", ""), source.get("n_text", ""))
     for col, old_t, fld in (
@@ -2806,7 +2830,7 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
             new_show = new_t or format_date_tuple(svod.get(fld_d))
             _apply_date_cell_diff(cell, old_show, new_show)
 
-    ensure_equipment_merges(ws, row, skip_rich_cols=True)
+    ensure_equipment_merges(ws, row)
 
 
 def _insert_deleted_source_rows(ws: Worksheet, deleted: list[dict],
@@ -2936,11 +2960,17 @@ def _write_clean_equipment_row(clean_ws: Worksheet, svod_ws: Worksheet,
         assert source_rec is not None
         src_ws = source_rec["src_ws"]
         src_row = source_rec["src_row"]
+        src_layout = source_rec.get("layout")
+        if not isinstance(src_layout, ProjectLayout):
+            src_layout = detect_project_layout(src_ws)
         copy_row_full(src_ws, src_row, clean_ws, dst_row)
         copy_merges_in_row(src_ws, src_row, clean_ws, dst_row)
         ensure_equipment_merges(clean_ws, dst_row)
         h_raw = source_rec.get("h_text", "")
         n_raw = source_rec.get("n_text", "")
+        # В чистовом листе раскладка должна соответствовать скопированной строке
+        # источника, если добавляем удалённые из проекта строки.
+        layout = src_layout
 
     clean_ws.cell(dst_row, 8).value = _strip_copy_boilerplate(h_raw) or None
     clean_ws.cell(dst_row, layout.col_repair).value = (
