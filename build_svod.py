@@ -149,6 +149,9 @@ DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые 
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
+DIFF_FALLBACK_RATIO = 0.55         # ниже — целиком «было / стало», не посимвольно
+DIFF_MAX_RICH_RUNS = 48            # лимит run'ов: Excel ломает sheet3.xml при переполнении
+_DIFF_TOKEN_RE = re.compile(r"\s+|\S+")
 
 # Фразы, убираемые на листе «вставить в ПК Ремонты» (время/тип ремонта могут отличаться).
 _AG_KINDS = r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР|РЕК)"
@@ -2407,21 +2410,21 @@ def match_source_and_svod(source_recs: list[dict],
         rk = record_match_key(sv)
         lst = pool.get(rk)
         if lst:
-            src = lst.pop(0)
+            src = _pop_best_source(lst, sv)
             if not lst:
                 pool.pop(rk, None)
         if src is None and not is_flat_match_group(sv):
             ok = record_match_key_no_rdu(sv)
             lst = obj_pool.get(ok)
             if lst:
-                src = lst.pop(0)
+                src = _pop_best_source(lst, sv)
                 if not lst:
                     obj_pool.pop(ok, None)
         if src is None and is_flat_match_group(sv):
             nk = _norm_match_key(sv.get("name", ""))
             lst = flat_name_pool.get(nk)
             if lst:
-                src = lst.pop(0)
+                src = _pop_best_source(lst, sv)
                 if not lst:
                     flat_name_pool.pop(nk, None)
         if src is not None:
@@ -2443,6 +2446,25 @@ def match_source_and_svod(source_recs: list[dict],
         stats.deleted_from_source += 1
 
     return pairs, stats
+
+
+def _source_match_score(src: dict, sv: dict) -> tuple[int, int, int, float]:
+    """Оценка совпадения исходника со строкой сводника (больше — лучше)."""
+    start_ok = int(_dates_equal(src.get("start"), sv.get("start")))
+    end_ok = int(_dates_equal(src.get("end"), sv.get("end")))
+    sim = difflib.SequenceMatcher(
+        None,
+        _norm_match_key(src.get("n_text", "")),
+        _norm_match_key(sv.get("n_text", "")),
+    ).ratio()
+    return (start_ok + end_ok, start_ok, end_ok, sim)
+
+
+def _pop_best_source(candidates: list[dict], sv: dict) -> dict:
+    """Из нескольких кандидатов с одним ключом — ближайший по датам и тексту N."""
+    best_i = max(range(len(candidates)),
+                 key=lambda i: _source_match_score(candidates[i], sv))
+    return candidates.pop(best_i)
 
 
 def _inline_font(base: Font | None, *, color: str | None = None,
@@ -2471,6 +2493,45 @@ def _prepare_cell_font_for_rich(cell) -> Font:
     )
 
 
+def _unmerge_diff_rich_text_blocks(ws: Worksheet, row: int,
+                                   col_repair: int = 14) -> None:
+    """Снимает A:D / H:M / N:O перед rich text — Excel ломает inlineStr в merge."""
+    blocks = [(1, 4), (8, 13), (col_repair, col_repair + 1)]
+    for lo, hi in blocks:
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_row != row or mr.max_row != row:
+                continue
+            if mr.min_col == lo and mr.max_col == hi:
+                try:
+                    ws.unmerge_cells(str(mr))
+                except Exception:
+                    pass
+
+
+def _diff_tokens(text: str) -> list[str]:
+    """Разбивает текст на слова и пробелы — diff по словам, не по символам."""
+    return _DIFF_TOKEN_RE.findall(text or "")
+
+
+def _join_diff_tokens(tokens: list[str]) -> str:
+    return "".join(tokens)
+
+
+def _text_diff_whole_replace(old: str, new: str,
+                             base_font: Font | None) -> CellRichText:
+    """Сильно различающиеся тексты: зачёркнутое «было», с новой строки «стало»."""
+    blocks: list[TextBlock] = []
+    if old:
+        blocks.append(TextBlock(
+            _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True), old))
+    if old and new:
+        blocks.append(TextBlock(_inline_font(base_font), "\n"))
+    if new:
+        blocks.append(TextBlock(
+            _inline_font(base_font, color=DIFF_COLOR_ADD), new))
+    return CellRichText(_coalesce_diff_blocks(blocks))
+
+
 def _diff_block_style_key(block: TextBlock) -> tuple:
     """Ключ стиля run'а для слияния соседних фрагментов одного типа."""
     f = block.font
@@ -2497,35 +2558,41 @@ def _coalesce_diff_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
 
 
 def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText | str:
-    """Rich text в стиле «Рецензирования»: зелёные вставки, красный зачёркнутый удалённый."""
+    """Rich text «Рецензирования»: diff по словам; при сильных отличиях — блок «было/стало»."""
     old = old or ""
     new = new or ""
     if old == new:
         return new
-    sm = difflib.SequenceMatcher(None, old, new)
+    ratio = difflib.SequenceMatcher(None, old, new).ratio()
+    if ratio < DIFF_FALLBACK_RATIO:
+        return _text_diff_whole_replace(old, new, base_font)
+
+    old_tokens = _diff_tokens(old)
+    new_tokens = _diff_tokens(new)
+    sm = difflib.SequenceMatcher(None, old_tokens, new_tokens)
     blocks: list[TextBlock] = []
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         if op == "equal":
-            chunk = new[j1:j2]
+            chunk = _join_diff_tokens(new_tokens[j1:j2])
             if chunk:
                 blocks.append(TextBlock(_inline_font(base_font), chunk))
         elif op == "delete":
-            chunk = old[i1:i2]
+            chunk = _join_diff_tokens(old_tokens[i1:i2])
             if chunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
                     chunk,
                 ))
         elif op == "insert":
-            chunk = new[j1:j2]
+            chunk = _join_diff_tokens(new_tokens[j1:j2])
             if chunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_ADD),
                     chunk,
                 ))
         elif op == "replace":
-            ochunk = old[i1:i2]
-            nchunk = new[j1:j2]
+            ochunk = _join_diff_tokens(old_tokens[i1:i2])
+            nchunk = _join_diff_tokens(new_tokens[j1:j2])
             if ochunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
@@ -2537,6 +2604,8 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
                     nchunk,
                 ))
     blocks = _coalesce_diff_blocks(blocks)
+    if len(blocks) > DIFF_MAX_RICH_RUNS:
+        return _text_diff_whole_replace(old, new, base_font)
     if not blocks:
         return new
     if len(blocks) == 1 and _diff_block_style_key(blocks[0]) == (None, False):
@@ -2545,7 +2614,7 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
 
 
 def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Подсветка изменения текста в ячейке — посимвольный diff."""
+    """Подсветка изменения текста в ячейке — diff по словам."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
     if _norm_match_key(old_t) == _norm_match_key(new_t):
@@ -2669,6 +2738,7 @@ def _write_diff_legend(ws: Worksheet) -> None:
         "только изменённые строки;  "
         "зелёный — добавленный текст;  "
         "красный зачёркнутый — удалённый;  "
+        "при полной замене текста — блок «было» / «стало»;  "
         "жёлтая заливка — изменённые даты E/F/G;  "
         "даты E/F/G — «было → стало» с diff;  "
         "зелёная строка — новая в своднике;  "
@@ -2693,7 +2763,8 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # A, H, N — посимвольный diff (режим «Рецензирования» Word).
+    # A, H, N — diff по словам (режим «Рецензирования»); перед rich text снимаем merge.
+    _unmerge_diff_rich_text_blocks(ws, row, layout.col_repair)
     for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
         _apply_text_cell_diff(
             ws.cell(row, col),
