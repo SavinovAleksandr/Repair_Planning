@@ -30,6 +30,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import tempfile
+import subprocess
+import json
+import os
 import re
 import shutil
 import sys
@@ -150,6 +154,12 @@ DIFF_FILL_NEW_ROW = "E2EFDA"       # светло-зелёная — новые 
 DIFF_FILL_DATE_CHG = "FFF2CC"      # жёлтая — изменённые даты
 DIFF_COLOR_ADD = "008000"          # зелёный текст (добавления)
 DIFF_COLOR_DEL = "FF0000"          # красный текст (удаления / «−»)
+
+# RichText через openpyxl иногда даёт Excel на Windows ошибку восстановления
+# «Строковые свойства из /xl/worksheets/sheetN.xml». Поэтому для листа
+# «Сравнение с проектами» мы сохраняем в xlsx обычный текст, а посимвольную
+# окраску/зачёркивание накладываем ПОСЛЕ сохранения через COM Excel.
+_EXCEL_CHAR_FORMAT_OPS: list[dict] = []
 
 # Фразы, убираемые на листе «вставить в ПК Ремонты» (время/тип ремонта могут отличаться).
 _AG_KINDS = r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР|РЕК)"
@@ -2620,47 +2630,82 @@ def _append_rich_run(runs: list[TextBlock], font: InlineFont, text: str) -> None
     runs.append(TextBlock(font, text))
 
 
-def _build_char_level_rich_diff(old_t: str, new_t: str,
-                                base_font: Font | None) -> CellRichText:
+def _build_char_level_diff_runs(old_t: str, new_t: str) -> list[tuple[str, str]]:
     """
-    Посимвольный diff для Excel:
-    - неизменённый текст остаётся обычным;
-    - удалённые символы из исходного текста — красные и зачёркнутые;
-    - добавленные символы — зелёные без зачёркиваний и подчёркиваний.
+    Посимвольный diff как список фрагментов: (текст, тип), где тип:
+    - base: неизменённый текст;
+    - del: удаляемый текст;
+    - add: добавляемый текст.
 
-    Важно для Windows Excel: rich text записывается только в левую верхнюю
-    ячейку объединённого диапазона, merge при этом сохраняется.
+    В xlsx сначала записывается обычная строка без rich text. Форматирование
+    фрагментов накладывается после сохранения файла через Excel COM. Это нужно
+    для Windows Excel: openpyxl rich text в merged cells может приводить к
+    восстановлению «строковых свойств» sheet.xml.
     """
-    base = _inline_font(base_font)
-    deleted = _inline_font(
-        base_font, color=DIFF_COLOR_DEL, strike=True)
-    added = _inline_font(base_font, color=DIFF_COLOR_ADD)
+    runs: list[tuple[str, str]] = []
 
-    runs: list[TextBlock] = []
+    def append(text: str, kind: str) -> None:
+        if not text:
+            return
+        if runs and runs[-1][1] == kind:
+            runs[-1] = (runs[-1][0] + text, kind)
+        else:
+            runs.append((text, kind))
+
     sm = difflib.SequenceMatcher(None, old_t, new_t, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
-            _append_rich_run(runs, base, old_t[i1:i2])
+            append(old_t[i1:i2], "base")
         elif tag == "delete":
-            _append_rich_run(runs, deleted, old_t[i1:i2])
+            append(old_t[i1:i2], "del")
         elif tag == "insert":
-            _append_rich_run(runs, added, new_t[j1:j2])
+            append(new_t[j1:j2], "add")
         elif tag == "replace":
-            _append_rich_run(runs, deleted, old_t[i1:i2])
-            _append_rich_run(runs, added, new_t[j1:j2])
+            append(old_t[i1:i2], "del")
+            append(new_t[j1:j2], "add")
+    return runs
 
-    return CellRichText(runs)
+
+def _plain_text_from_runs(runs: list[tuple[str, str]]) -> str:
+    return "".join(text for text, _kind in runs)
+
+
+def _register_excel_char_format(ws: Worksheet, cell,
+                                runs: list[tuple[str, str]]) -> None:
+    """Запоминает фрагменты для последующего форматирования через Excel COM."""
+    spans: list[dict] = []
+    pos = 1  # Excel Characters() uses 1-based start
+    for text, kind in runs:
+        length = len(text)
+        if length and kind in ("del", "add"):
+            spans.append({"start": pos, "length": length, "kind": kind})
+        pos += length
+    if spans:
+        _EXCEL_CHAR_FORMAT_OPS.append({
+            "sheet": ws.title,
+            "row": cell.row,
+            "col": cell.column,
+            "spans": spans,
+        })
 
 
 def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Посимвольная подсветка изменения в A/H/N без формата «− было / + стало»."""
+    """Посимвольная подсветка изменения в A/H/N без openpyxl RichText."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
     if not _texts_meaningfully_differ(old_t, new_t):
         return
-    base_font = cell.font
-    rich = _build_char_level_rich_diff(old_t, new_t, base_font)
-    _set_cell_rich_diff(cell, rich, wrap=wrap)
+    runs = _build_char_level_diff_runs(old_t, new_t)
+    cell.value = _plain_text_from_runs(runs)
+    _register_excel_char_format(cell.parent, cell, runs)
+    if wrap:
+        al = cell.alignment
+        cell.alignment = Alignment(
+            horizontal=al.horizontal if al and al.horizontal else "left",
+            vertical="center",
+            wrap_text=True,
+            text_rotation=al.text_rotation if al else 0,
+        )
     cell.fill = PatternFill(
         start_color=DIFF_FILL_DATE_CHG,
         end_color=DIFF_FILL_DATE_CHG,
@@ -2668,35 +2713,30 @@ def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -
     )
 
 
-def _format_date_change(old_t: str, new_t: str, old_d: tuple | None,
-                        new_d: tuple | None, base_font: Font | None
-                        ) -> CellRichText | str:
-    """Ячейка даты/числа: «было → стало» в 2 run'ах (Excel-safe)."""
+def _format_date_change_runs(old_t: str, new_t: str,
+                             old_d: tuple | None,
+                             new_d: tuple | None) -> list[tuple[str, str]]:
+    """E/F/G: plain text «было → стало», зелёным выделяем новое значение."""
     new_show = new_t or (format_date_tuple(new_d) if new_d else "")
     old_show = old_t or (format_date_tuple(old_d) if old_d else "")
     if not _texts_meaningfully_differ(old_show, new_show):
-        return new_show
+        return [(new_show, "base")]
     if not old_show:
-        return new_show
+        return [(new_show, "add")]
     if not new_show:
-        return CellRichText([
-            TextBlock(_inline_font(base_font, color=DIFF_COLOR_DEL), old_show),
-        ])
-    return CellRichText([
-        TextBlock(_inline_font(base_font), f"{old_show} → "),
-        TextBlock(_inline_font(base_font, color=DIFF_COLOR_ADD), new_show),
-    ])
+        return [(old_show, "del")]
+    return [(f"{old_show} → ", "base"), (new_show, "add")]
 
 
 def _apply_date_cell_diff(cell, old_show: str, new_show: str) -> None:
-    """Подсветка изменения в E/F/G: rich text и жёлтая заливка."""
+    """Подсветка изменения в E/F/G без openpyxl RichText."""
     old_show = str(old_show or "").strip()
     new_show = str(new_show or "").strip()
     if not _texts_meaningfully_differ(old_show, new_show):
         return
-    cell.value = _format_date_change(
-        old_show, new_show, None, None, cell.font)
-    cell.font = _prepare_cell_font_for_rich(cell)
+    runs = _format_date_change_runs(old_show, new_show, None, None)
+    cell.value = _plain_text_from_runs(runs)
+    _register_excel_char_format(cell.parent, cell, runs)
     cell.fill = PatternFill(
         start_color=DIFF_FILL_DATE_CHG,
         end_color=DIFF_FILL_DATE_CHG,
@@ -3140,6 +3180,116 @@ def build_diff_sheet(wb: openpyxl.Workbook, svod_ws: Worksheet,
     return stats
 
 
+def _apply_excel_com_char_formats(xlsx_path: Path, log=print) -> None:
+    """
+    Накладывает посимвольное форматирование через установленный Excel.
+
+    ВАЖНО: не используем openpyxl RichText для листа «Сравнение с проектами»,
+    потому что Excel на Windows может восстанавливать «Строковые свойства» из
+    sheet.xml. Вместо этого xlsx сначала сохраняется как обычный валидный файл,
+    затем сам Excel через COM применяет формат к отдельным символам.
+
+    Формат:
+      - удаляемые символы: красный + зачёркнутый;
+      - добавляемые символы: зелёный;
+      - подчёркивание не используется.
+    """
+    if not _EXCEL_CHAR_FORMAT_OPS:
+        return
+    if os.name != "nt":
+        log("  посимвольное форматирование через Excel COM пропущено: не Windows")
+        return
+
+    # Используем PowerShell + Excel COM, чтобы не требовать pywin32.
+    ps_script = r'''
+param(
+    [Parameter(Mandatory=$true)][string]$WorkbookPath,
+    [Parameter(Mandatory=$true)][string]$OpsPath
+)
+$ErrorActionPreference = "Stop"
+$ops = Get-Content -Path $OpsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$excel = $null
+$wb = $null
+try {
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+    $wb = $excel.Workbooks.Open($WorkbookPath)
+
+    $COLOR_BLACK = 0
+    $COLOR_RED = 255
+    $COLOR_GREEN = 32768
+    $UNDERLINE_NONE = -4142
+
+    foreach ($op in $ops) {
+        $ws = $wb.Worksheets.Item([string]$op.sheet)
+        $cell = $ws.Cells.Item([int]$op.row, [int]$op.col)
+        $text = [string]$cell.Value2
+        $len = $text.Length
+        if ($len -gt 0) {
+            $fontAll = $cell.Characters(1, $len).Font
+            $fontAll.Color = $COLOR_BLACK
+            $fontAll.Strikethrough = $false
+            $fontAll.Underline = $UNDERLINE_NONE
+        }
+        foreach ($span in $op.spans) {
+            $start = [int]$span.start
+            $length = [int]$span.length
+            if ($length -le 0) { continue }
+            $font = $cell.Characters($start, $length).Font
+            $font.Underline = $UNDERLINE_NONE
+            if ([string]$span.kind -eq "del") {
+                $font.Color = $COLOR_RED
+                $font.Strikethrough = $true
+            } elseif ([string]$span.kind -eq "add") {
+                $font.Color = $COLOR_GREEN
+                $font.Strikethrough = $false
+            }
+        }
+    }
+    $wb.Save()
+}
+finally {
+    if ($wb -ne $null) { $wb.Close($true) | Out-Null }
+    if ($excel -ne $null) { $excel.Quit() | Out-Null }
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+}
+'''
+    with tempfile.TemporaryDirectory(prefix="repair_diff_") as tmp:
+        tmp_path = Path(tmp)
+        ops_path = tmp_path / "ops.json"
+        ps_path = tmp_path / "apply_diff_format.ps1"
+        ops_path.write_text(
+            json.dumps(_EXCEL_CHAR_FORMAT_OPS, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        ps_path.write_text(ps_script, encoding="utf-8")
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", str(ps_path),
+            "-WorkbookPath", str(xlsx_path.resolve()),
+            "-OpsPath", str(ops_path),
+        ]
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", timeout=120
+            )
+        except FileNotFoundError:
+            log("  ВНИМАНИЕ: PowerShell не найден, посимвольное форматирование не применено")
+            return
+        except subprocess.TimeoutExpired:
+            log("  ВНИМАНИЕ: Excel COM форматирование превысило таймаут 120 сек")
+            return
+        if res.returncode != 0:
+            msg = (res.stderr or res.stdout or "").strip()
+            log(f"  ВНИМАНИЕ: Excel COM форматирование не выполнено: {msg}")
+            return
+    log("  посимвольное форматирование применено через Excel COM")
+
+
 def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
                              year_hint: int | None = None,
                              log=print) -> DiffStats:
@@ -3156,6 +3306,7 @@ def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
       • жёлтая заливка — изменённые даты начала/окончания.
     """
     root = root or ROOT
+    _EXCEL_CHAR_FORMAT_OPS.clear()
     log(f"Сравнение с проектами: {svod_path.name}")
     log(f"  за основу: {svod_path} (лист Page1)")
     log("  эталон: проекты Коми/Арх РДУ из папки программы")
@@ -3179,6 +3330,7 @@ def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
     log(f"  лист «{DIFF_SHEET_NAME}» создан.")
     log(f"  лист «{DIFF_CLEAN_SHEET_NAME}» — plain text для вставки в ПК «Ремонты».")
     _save_with_backup(wb, svod_path, log=log)
+    _apply_excel_com_char_formats(svod_path, log=log)
     return stats
 
 
