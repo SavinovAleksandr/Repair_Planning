@@ -151,7 +151,6 @@ DIFF_COLOR_ADD = "008000"          # зелёный текст (добавлен
 DIFF_COLOR_DEL = "FF0000"          # красный зачёркнутый (удаления)
 DIFF_FALLBACK_RATIO = 0.55         # ниже — целиком «было / стало», не посимвольно
 DIFF_MAX_RICH_RUNS = 48            # лимит run'ов: Excel ломает sheet3.xml при переполнении
-_DIFF_TOKEN_RE = re.compile(r"\s+|\S+")
 
 # Фразы, убираемые на листе «вставить в ПК Ремонты» (время/тип ремонта могут отличаться).
 _AG_KINDS = r"(?:ВПр|ТР|СР|КР|ИСП|ЗРР|БВР|РЕК)"
@@ -1863,7 +1862,9 @@ def is_toc_row(ws: Worksheet, row: int) -> bool:
 
 
 def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
-                              src_key: str = "svod") -> list[dict]:
+                              src_key: str = "svod",
+                              section_rdu_map: dict[str, str] | None = None
+                              ) -> list[dict]:
     """Аналог `extract_records`, но для уже сгенерированного сводника.
 
     Пропускает строку оглавления и строки-заголовки групп (таких подгрупп
@@ -1893,13 +1894,18 @@ def extract_records_from_svod(ws_svod: Worksheet, default_year: int,
             continue
 
         # Определяем, из какого РДУ запись. В своднике это признак косвенный:
-        # секция-подзаголовок может содержать «Архангельского» / «Коми».
+        # секция-подзаголовок может содержать «Архангельского» / «Коми»;
+        # иначе — однозначная привязка по исходным проектам (section_rdu_map).
         rdu = "Коми"
         sec_lc = current_section.lower()
         if "арх" in sec_lc:
             rdu = "Арх"
         elif "коми" in sec_lc:
             rdu = "Коми"
+        elif section_rdu_map:
+            mapped = section_rdu_map.get(_norm(current_section))
+            if mapped:
+                rdu = mapped
 
         start_raw = _cell_text_with_merges(ws_svod, r, layout.col_start)
         end_raw = _cell_text_with_merges(ws_svod, r, layout.col_end)
@@ -2344,14 +2350,40 @@ def _dates_equal(a: tuple | None, b: tuple | None) -> bool:
     return a == b
 
 
+def _build_section_rdu_map(source_recs: list[dict]) -> dict[str, str]:
+    """Секция → РДУ, если в исходных проектах она относится только к одному РДУ."""
+    from collections import defaultdict
+
+    acc: dict[str, set[str]] = defaultdict(set)
+    for rec in source_recs:
+        sec = _norm(rec.get("section") or "")
+        rdu = str(rec.get("rdu") or "").strip()
+        if sec and rdu:
+            acc[sec].add(rdu)
+    return {sec: next(iter(rdus)) for sec, rdus in acc.items() if len(rdus) == 1}
+
+
+def _align_source_hn_for_diff(h: str, n: str) -> tuple[str, str]:
+    """Приводит H/N исходника к той же схеме переноса фраз H→N, что при сборке сводника."""
+    stats = NormStats()
+    new_h, moves = _apply_h_rules(h or "", stats)
+    new_n = _append_moves_to_note(n or "", moves)
+    return new_h, new_n
+
+
 def _record_fields_differ(svod: dict, source: dict) -> bool:
     if not _dates_equal(svod.get("start"), source.get("start")):
         return True
     if not _dates_equal(svod.get("end"), source.get("end")):
         return True
-    if _norm_match_key(svod.get("h_text", "")) != _norm_match_key(source.get("h_text", "")):
+    src_h, src_n = _align_source_hn_for_diff(
+        source.get("h_text", ""), source.get("n_text", ""))
+    if _norm_match_key(svod.get("h_text", "")) != _norm_match_key(src_h):
         return True
-    if _norm_match_key(svod.get("n_text", "")) != _norm_match_key(source.get("n_text", "")):
+    if _norm_match_key(svod.get("n_text", "")) != _norm_match_key(src_n):
+        return True
+    if _norm_match_key(svod.get("days_text", "")) != _norm_match_key(
+            source.get("days_text", "")):
         return True
     if _norm_match_key(svod.get("name", "")) != _norm_match_key(source.get("name", "")):
         return True
@@ -2508,15 +2540,6 @@ def _unmerge_diff_rich_text_blocks(ws: Worksheet, row: int,
                     pass
 
 
-def _diff_tokens(text: str) -> list[str]:
-    """Разбивает текст на слова и пробелы — diff по словам, не по символам."""
-    return _DIFF_TOKEN_RE.findall(text or "")
-
-
-def _join_diff_tokens(tokens: list[str]) -> str:
-    return "".join(tokens)
-
-
 def _text_diff_whole_replace(old: str, new: str,
                              base_font: Font | None) -> CellRichText:
     """Сильно различающиеся тексты: зачёркнутое «было», с новой строки «стало»."""
@@ -2558,7 +2581,7 @@ def _coalesce_diff_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
 
 
 def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText | str:
-    """Rich text «Рецензирования»: diff по словам; при сильных отличиях — блок «было/стало»."""
+    """Rich text «Рецензирования»: посимвольный diff; при сильных отличиях — «было/стало»."""
     old = old or ""
     new = new or ""
     if old == new:
@@ -2567,32 +2590,30 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
     if ratio < DIFF_FALLBACK_RATIO:
         return _text_diff_whole_replace(old, new, base_font)
 
-    old_tokens = _diff_tokens(old)
-    new_tokens = _diff_tokens(new)
-    sm = difflib.SequenceMatcher(None, old_tokens, new_tokens)
+    sm = difflib.SequenceMatcher(None, old, new)
     blocks: list[TextBlock] = []
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         if op == "equal":
-            chunk = _join_diff_tokens(new_tokens[j1:j2])
+            chunk = new[j1:j2]
             if chunk:
                 blocks.append(TextBlock(_inline_font(base_font), chunk))
         elif op == "delete":
-            chunk = _join_diff_tokens(old_tokens[i1:i2])
+            chunk = old[i1:i2]
             if chunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
                     chunk,
                 ))
         elif op == "insert":
-            chunk = _join_diff_tokens(new_tokens[j1:j2])
+            chunk = new[j1:j2]
             if chunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_ADD),
                     chunk,
                 ))
         elif op == "replace":
-            ochunk = _join_diff_tokens(old_tokens[i1:i2])
-            nchunk = _join_diff_tokens(new_tokens[j1:j2])
+            ochunk = old[i1:i2]
+            nchunk = new[j1:j2]
             if ochunk:
                 blocks.append(TextBlock(
                     _inline_font(base_font, color=DIFF_COLOR_DEL, strike=True),
@@ -2614,7 +2635,7 @@ def _text_diff_rich(old: str, new: str, base_font: Font | None) -> CellRichText 
 
 
 def _apply_text_cell_diff(cell, old_t: str, new_t: str, *, wrap: bool = False) -> None:
-    """Подсветка изменения текста в ячейке — diff по словам."""
+    """Подсветка изменения текста в ячейке — посимвольный diff."""
     old_t = str(old_t or "")
     new_t = str(new_t or "")
     if _norm_match_key(old_t) == _norm_match_key(new_t):
@@ -2763,12 +2784,18 @@ def _annotate_equipment_row_diff(ws: Worksheet, row: int, svod: dict,
     if status == "same" or source is None:
         return
 
-    # A, H, N — diff по словам (режим «Рецензирования»); перед rich text снимаем merge.
+    # A, H, N — посимвольный diff (режим «Рецензирования»); перед rich text снимаем merge.
     _unmerge_diff_rich_text_blocks(ws, row, layout.col_repair)
-    for col, fld in ((1, "name"), (8, "h_text"), (layout.col_repair, "n_text")):
+    src_h, src_n = _align_source_hn_for_diff(
+        source.get("h_text", ""), source.get("n_text", ""))
+    for col, old_t, fld in (
+        (1, source.get("name", ""), "name"),
+        (8, src_h, "h_text"),
+        (layout.col_repair, src_n, "n_text"),
+    ):
         _apply_text_cell_diff(
             ws.cell(row, col),
-            source.get(fld, ""),
+            old_t,
             svod.get(fld, ""),
             wrap=(col in (8, layout.col_repair)),
         )
@@ -3111,12 +3138,14 @@ def stage_build_diff_inplace(svod_path: Path, root: Path | None = None,
     log("  эталон: проекты Коми/Арх РДУ из папки программы")
     parse_year = default_year_for_svod(svod_path, year_hint)
     source_recs = load_source_records(root, parse_year, log=log)
+    section_rdu_map = _build_section_rdu_map(source_recs)
 
     wb = openpyxl.load_workbook(svod_path)
     if "Page1" not in wb.sheetnames:
         raise RuntimeError("В файле нет листа «Page1».")
     ws = wb["Page1"]
-    svod_recs = extract_records_from_svod(ws, default_year=parse_year)
+    svod_recs = extract_records_from_svod(
+        ws, default_year=parse_year, section_rdu_map=section_rdu_map)
 
     stats = build_diff_sheet(wb, ws, source_recs, svod_recs, log=log)
     log(
