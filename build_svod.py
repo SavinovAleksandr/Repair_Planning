@@ -2552,11 +2552,13 @@ def _inline_font(base: Font | None, *, color: str | None = None,
     size = base.size if base and base.size else 10.0
     kw: dict = {"rFont": name, "sz": size}
     if color:
-        kw["color"] = f"00{color}" if len(color) == 6 else color
+        kw["color"] = f"FF{color}" if len(color) == 6 else color
     if strike:
         kw["strike"] = True
-    if underline:
-        kw["u"] = "single"
+    # В rich text Excel на Windows иногда восстанавливает файл,
+    # если внутри inlineStr есть подчёркивание. По требованиям пользователя
+    # подчёркивание не используется вообще.
+    # Параметр underline оставлен только для совместимости вызовов.
     if bold:
         kw["b"] = True
     return InlineFont(**kw)
